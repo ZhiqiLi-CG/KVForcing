@@ -21,6 +21,8 @@ match_context: true
 # kv_forcing: blocks per activation-checkpoint region (1 = every block; larger trades
 # recomputation memory for fewer kept block outputs, numerically identical)
 kv_forcing_checkpoint_group: 5
+# with mixed_precision false, still run the frozen teacher (real_score) in bf16
+real_score_bf16: false
 # ==== ours end ====
 causal: true
 

@@ -20,13 +20,19 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
-def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):
+def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False,
+              # ======== ours ========
+              cast_forward_inputs=False
+              # ==== ours end ====
+              ):
     if mixed_precision:
         mixed_precision_policy = MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             buffer_dtype=torch.float32,
-            cast_forward_inputs=False
+            # ======== ours ========
+            cast_forward_inputs=cast_forward_inputs
+            # ==== ours end ====
         )
     else:
         mixed_precision_policy = None

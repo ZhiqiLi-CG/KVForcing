@@ -70,10 +70,21 @@ class Trainer:
             cpu_offload=False
         )
 
+        # ======== ours ========
+        # The frozen teacher (real_score) may run in bf16 while everything that is
+        # trained stays fp32: it has no gradients, so no accumulation precision is
+        # at stake, and it is by far the largest model. Its inputs are cast on entry.
+        teacher_bf16 = bool(getattr(config, "real_score_bf16", False)) and not config.mixed_precision
+        if teacher_bf16:
+            self.model.real_score.to(torch.bfloat16)
+        # ==== ours end ====
         self.model.real_score = fsdp_wrap(
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
+            # ======== ours ========
+            mixed_precision=config.mixed_precision or teacher_bf16,
+            cast_forward_inputs=teacher_bf16,
+            # ==== ours end ====
             wrap_strategy=config.real_score_fsdp_wrap_strategy,
             cpu_offload=False
         )
@@ -401,6 +412,11 @@ class Trainer:
 
                 log_str = "  ".join(f"{k}: {v:.4f}" for k, v in wandb_loss_dict.items())
                 print(f"[step {self.step}] {log_str}", flush=True)
+                # ======== ours ========
+                if self.step % self.config.log_iters == 0 and torch.cuda.is_available():
+                    print("[mem] step %d: max allocated %.1f GiB, max reserved %.1f GiB (this rank)" % (
+                        self.step, torch.cuda.max_memory_allocated() / 2**30, torch.cuda.max_memory_reserved() / 2**30), flush=True)
+                # ==== ours end ====
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
