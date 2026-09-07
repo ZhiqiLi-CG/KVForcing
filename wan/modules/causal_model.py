@@ -155,6 +155,25 @@ class PersistentKVStore:
         """Tuples of page references; appending later cannot change a snapshot."""
         return tuple((tuple(self.k_pages[l]), tuple(self.v_pages[l]))
                      for l in range(self.num_layers))
+
+
+class _PageCat(torch.autograd.Function):
+    """torch.cat over the history pages whose backward hands each page a
+    CONTIGUOUS gradient. cat's own backward returns views into the one big
+    dK/dV buffer of the whole history; a page's first gradient contribution is
+    stored as that view, which pins the entire buffer (30 layers x K,V x the
+    whole history) until the page is consumed. Cloning the slices costs one
+    transient copy and frees the buffer at once. Numerically identical.
+    """
+
+    @staticmethod
+    def forward(ctx, *pages):
+        ctx.sizes = [p.shape[1] for p in pages]
+        return torch.cat(pages, dim=1)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return tuple(g.contiguous().clone() for g in grad.split(ctx.sizes, dim=1))
 # ==== ours end ====
 
 
@@ -530,8 +549,8 @@ class CausalWanSelfAttention(nn.Module):
         q_rope = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         k_rope = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         if len(history_k):
-            k_attn = torch.cat((*history_k, k_rope), dim=1)
-            v_attn = torch.cat((*history_v, v), dim=1)
+            k_attn = _PageCat.apply(*history_k, k_rope)
+            v_attn = _PageCat.apply(*history_v, v)
         else:
             k_attn, v_attn = k_rope, v
         y = self.o(attention(q_rope, k_attn, v_attn).flatten(2))
@@ -855,9 +874,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_frame_per_block = 1
         self.independent_first_frame = False
         # ======== ours ========
-        # KV Forcing: checkpoint every block of the two persistent forwards.
-        # Set by KVForcingTrainingPipeline; inference never takes that path.
+        # KV Forcing: checkpoint the two persistent forwards in groups of
+        # `persistent_checkpoint_group` blocks (1 = every block). Set by
+        # KVForcingTrainingPipeline; inference never takes that path.
         self.persistent_block_checkpointing = False
+        self.persistent_checkpoint_group = 1
         # ==== ours end ====
 
     def _set_gradient_checkpointing(self, module, value=False):
@@ -1443,20 +1464,44 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]))
         return x, grid_sizes, e, e0, ctx
 
-    def _maybe_ckpt(self, block, *args, **kwargs):
-        """Activation checkpointing inside the FSDP unit, as _forward_train does."""
-        if self.persistent_block_checkpointing and torch.is_grad_enabled():
-            return torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False, **kwargs)
-        return block(*args, **kwargs)
+    def _run_blocks(self, first, last, x, e0, grid_sizes, ctx, histories, frame_idx, write_page):
+        """Blocks first..last-1 of one persistent forward. Returns x, then the
+        pages of those blocks (k, v per block) when write_page is set."""
+        pages = []
+        for layer_idx in range(first, last):
+            hk, hv = histories[layer_idx]
+            out = self.blocks[layer_idx](x, e0, None, grid_sizes, self.freqs, ctx, None, None,
+                                         persistent=dict(history_k=hk, history_v=hv,
+                                                         current_start_frame=frame_idx,
+                                                         write_page=write_page))
+            if write_page:
+                x, new_k, new_v = out
+                pages.extend([new_k, new_v])
+            else:
+                x = out
+        return (x, *pages)
+
+    def _persistent_blocks(self, x, e0, grid_sizes, ctx, histories, frame_idx, write_page):
+        """All blocks of one persistent forward, activation-checkpointed in
+        groups of `persistent_checkpoint_group` blocks INSIDE the FSDP unit
+        (the composition PyTorch supports, as _forward_train does). Only the
+        group boundaries are kept between forward and backward: 1 keeps every
+        block output, a larger group keeps fewer outputs and recomputes more
+        blocks per group. Pages are group outputs, so they are always kept."""
+        n, g = len(self.blocks), max(1, int(self.persistent_checkpoint_group))
+        ckpt = self.persistent_block_checkpointing and torch.is_grad_enabled()
+        pages = []
+        for first in range(0, n, g):
+            args = (first, min(first + g, n), x, e0, grid_sizes, ctx, histories, frame_idx, write_page)
+            out = (torch.utils.checkpoint.checkpoint(self._run_blocks, *args, use_reentrant=False)
+                   if ckpt else self._run_blocks(*args))
+            x, pages = out[0], pages + list(out[1:])
+        return x, pages
 
     def forward_noisy_frame(self, latent, t, context, histories, frame_idx):
         """The frame the loss sees: reads the history pages, writes none."""
         x, grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
-        for layer_idx, block in enumerate(self.blocks):
-            hk, hv = histories[layer_idx]
-            x = self._maybe_ckpt(block, x, e0, None, grid_sizes, self.freqs, ctx, None, None,
-                                 persistent=dict(history_k=hk, history_v=hv,
-                                                 current_start_frame=frame_idx, write_page=False))
+        x, _ = self._persistent_blocks(x, e0, grid_sizes, ctx, histories, frame_idx, write_page=False)
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         return torch.stack(self.unpatchify(x, grid_sizes))
 
@@ -1464,14 +1509,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         """The memory write. Returns this frame's pages as (k0, v0, k1, v1, ...);
         no head, since a clean frame only provides context."""
         x, grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
-        pages = []
-        for layer_idx, block in enumerate(self.blocks):
-            hk, hv = histories[layer_idx]
-            x, new_k, new_v = self._maybe_ckpt(
-                block, x, e0, None, grid_sizes, self.freqs, ctx, None, None,
-                persistent=dict(history_k=hk, history_v=hv,
-                                current_start_frame=frame_idx, write_page=True))
-            pages.extend([new_k, new_v])
+        _, pages = self._persistent_blocks(x, e0, grid_sizes, ctx, histories, frame_idx, write_page=True)
         return tuple(pages)
     # ==== ours end ====
 

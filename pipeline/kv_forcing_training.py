@@ -42,6 +42,7 @@ class KVForcingTrainingPipeline:
         match_context: bool = True,
         cache_mode: str = "exit",
         gradient_checkpointing: bool = True,
+        checkpoint_group: int = 1,
         **kwargs,
     ):
         if cache_mode not in ("exit", "final_clean"):
@@ -64,6 +65,9 @@ class KVForcingTrainingPipeline:
         self.match_context = match_context
         self.cache_mode = cache_mode
         self.gradient_checkpointing = gradient_checkpointing
+        # blocks per activation-checkpoint region; larger keeps fewer block
+        # outputs alive between forward and backward (see CausalWanModel._persistent_blocks)
+        self.checkpoint_group = int(checkpoint_group)
 
     @property
     def _model(self):
@@ -131,6 +135,7 @@ class KVForcingTrainingPipeline:
         train_t = self.denoising_step_list[idx]
 
         model.persistent_block_checkpointing = self.gradient_checkpointing
+        model.persistent_checkpoint_group = self.checkpoint_group
         store = PersistentKVStore(len(model.blocks))
         outputs = []
         start = 0

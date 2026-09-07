@@ -20,7 +20,7 @@ num_train_timestep: 1000
 timestep_shift: 5.0
 guidance_scale: 3.0
 denoising_loss_type: flow
-mixed_precision: true
+mixed_precision: false   # fp32 weights/activations/gradients; flash-attn itself computes in bf16
 seed: 0   # 0 draws a random seed (trainer/distillation.py); set a nonzero value for a controlled A/B
 wandb_host: https://api.wandb.ai
 wandb_key: {your key}

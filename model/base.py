@@ -249,6 +249,7 @@ class SelfForcingModel(BaseModel):
                 match_context=getattr(self.args, "match_context", True),
                 cache_mode=getattr(self.args, "cache_mode", "exit"),
                 gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
+                checkpoint_group=getattr(self.args, "kv_forcing_checkpoint_group", 1),
             )
             return
         # ==== ours end ====

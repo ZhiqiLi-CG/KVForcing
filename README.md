@@ -72,7 +72,12 @@ every node for multi-node training (see the script for the rendezvous
 options). Set `seed` to a nonzero value in both configs for a controlled A/B:
 `seed: 0` draws a random seed.
 
-The three configs are identical apart from `grad_mode`. `local_attn_size`
+The configs train in fp32 (`mixed_precision: false`); flash-attn itself always runs in bf16.
+`kv_forcing_checkpoint_group` sets how many blocks share one activation-checkpoint region
+(default 5: at 21 frames the one-pass peaks at 17.3 GiB of activations on one GPU versus
+20.5 GiB with a region per block, and runs faster; the numerics are identical).
+
+The configs are identical apart from `grad_mode`. `local_attn_size`
 and `sink_size` must together cover the training clip (18 + 3 = 21 frames):
 the KV Forcing pages are attended to in full, which equals sink + window
 attention only while the two cover the clip, and the pipeline refuses longer

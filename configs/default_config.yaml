@@ -18,6 +18,9 @@ cache_mode: exit
 # kv_forcing: write the memory with the same noised context and timestep the
 # autoregressive rollout uses (True), or with the clean prediction at t=0 (False)
 match_context: true
+# kv_forcing: blocks per activation-checkpoint region (1 = every block; larger trades
+# recomputation memory for fewer kept block outputs, numerically identical)
+kv_forcing_checkpoint_group: 5
 # ==== ours end ====
 causal: true
 
