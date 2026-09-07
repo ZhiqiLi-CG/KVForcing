@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local environments
+.env
+.venv/
+venv/
+
+# Model / data artifacts (downloaded by scripts/download_weights.sh)
+checkpoints/
+wan_models/
+dataset/
+prompts/vidprom_filtered_extended.txt
+
+# Official VBench evaluator, cloned separately (see scripts/eval/eval_vbench.sh)
+VBench/
+.vbench_cache/
+
+# Run artifacts
+logs/
+outputs/
+output/
+.rendezvous/
+*.mp4
+*.log
+.DS_Store
