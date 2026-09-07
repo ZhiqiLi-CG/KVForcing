@@ -8,8 +8,10 @@ __pycache__/
 .venv/
 venv/
 
-# Model / data artifacts (downloaded by scripts/download_weights.sh)
+# Model / data artifacts (downloaded by scripts/download_weights.sh); also as symlinks
+checkpoints
 checkpoints/
+wan_models
 wan_models/
 dataset/
 prompts/vidprom_filtered_extended.txt
