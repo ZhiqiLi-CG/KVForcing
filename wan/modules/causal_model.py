@@ -129,32 +129,161 @@ class MemoryLoRA(nn.Module):
 
 # ======== ours ========
 class PersistentKVStore:
-    """Immutable K/V pages written by the KV Forcing rollout.
+    """Immutable pages written by the KV Forcing rollout.
 
-    A page is the (post-RoPE K, V) one frame contributes to one layer. The
-    autoregressive KV cache overwrites a slot in place; a page is never
-    modified, so it can carry a graph, and a checkpointed frame recomputes
-    against exactly the history it saw at forward time.
+    page_mode "kv": a page is the (post-RoPE K, V) one frame contributes to one
+    layer. The autoregressive KV cache overwrites a slot in place; a page is
+    never modified, so it can carry a graph, and a checkpointed frame
+    recomputes against exactly the history it saw at forward time.
+
+    page_mode "h": a page is the writer's self-attention input h of that layer
+    (dim values per token instead of 2 * dim), so the pages and their gradients
+    take half the memory. K/V are a function of h and the writer's projection:
+    a reader WITH gradient rebuilds the history K/V from the h pages with the
+    writer's own ops (k/v projection incl. Memory-LoRA, norm_k, RoPE at the
+    page's frame) inside its checkpoint region, so the rebuilt K/V exist only
+    while that region is computed or recomputed (_rebuild_history_kv). A
+    reader WITHOUT gradient (the rollout) reads the "mirror": a detached,
+    contiguous copy of the K/V the writers produced, i.e. the inference KV
+    cache, which costs no rebuild. The mirror is local to one rollout and is
+    never captured by a graph, so it is freed before backward.
     """
 
-    def __init__(self, num_layers):
+    def __init__(self, num_layers, page_mode="kv", max_frames=None):
+        if page_mode not in ("kv", "h"):
+            raise ValueError(f"page_mode must be 'kv' or 'h'. Got {page_mode!r}.")
+        if page_mode == "h" and max_frames is None:
+            raise ValueError("page_mode 'h' needs max_frames (the mirror is preallocated).")
         self.num_layers = num_layers
-        self.k_pages = [[] for _ in range(num_layers)]
-        self.v_pages = [[] for _ in range(num_layers)]
+        self.page_mode = page_mode
+        self.max_frames = max_frames
+        self.num_frames = 0
+        if page_mode == "kv":
+            self.k_pages = [[] for _ in range(num_layers)]
+            self.v_pages = [[] for _ in range(num_layers)]
+        else:
+            self.h_pages = [[] for _ in range(num_layers)]
+            self.mirror_k = [None] * num_layers
+            self.mirror_v = [None] * num_layers
 
     def __len__(self):
-        return len(self.k_pages[0])
+        return self.num_frames
 
     def append_all_layers(self, flat_pages):
-        """flat_pages is (k0, v0, k1, v1, ...), the writer's flattened output."""
-        for layer_idx in range(self.num_layers):
-            self.k_pages[layer_idx].append(flat_pages[2 * layer_idx])
-            self.v_pages[layer_idx].append(flat_pages[2 * layer_idx + 1])
+        """flat_pages is the writer's flattened output: (k0, v0, k1, v1, ...)
+        for "kv"; (h0, k0, v0, h1, k1, v1, ...) for "h", where h is None when
+        the writer ran without gradient and k/v are detached (mirror only; None
+        when that writer already put them into the mirror)."""
+        if self.page_mode == "kv":
+            for layer_idx in range(self.num_layers):
+                self.k_pages[layer_idx].append(flat_pages[2 * layer_idx])
+                self.v_pages[layer_idx].append(flat_pages[2 * layer_idx + 1])
+        else:
+            f = self.num_frames
+            with torch.no_grad():
+                for layer_idx in range(self.num_layers):
+                    h, k, v = flat_pages[3 * layer_idx:3 * layer_idx + 3]
+                    if h is not None:
+                        self.h_pages[layer_idx].append(h)
+                    if k is None:       # a writer without gradient wrote its slot itself
+                        continue
+                    if self.mirror_k[layer_idx] is None:
+                        shape = (k.shape[0], self.max_frames * k.shape[1], *k.shape[2:])
+                        self.mirror_k[layer_idx] = k.new_empty(shape)
+                        self.mirror_v[layer_idx] = v.new_empty(shape)
+                    s = k.shape[1]
+                    self.mirror_k[layer_idx][:, f * s:(f + 1) * s].copy_(k)
+                    self.mirror_v[layer_idx][:, f * s:(f + 1) * s].copy_(v)
+        self.num_frames += 1
 
-    def snapshot_all_layers(self):
-        """Tuples of page references; appending later cannot change a snapshot."""
-        return tuple((tuple(self.k_pages[l]), tuple(self.v_pages[l]))
+    def snapshot_all_layers(self, verify=False):
+        """History for readers WITH gradient. Tuples of page references;
+        appending later cannot change a snapshot. verify (h only) attaches the
+        mirror so _rebuild_history_kv can check the rebuild bitwise against the
+        K/V the writers produced (debug: it keeps the mirror alive)."""
+        if self.page_mode == "kv":
+            return tuple((tuple(self.k_pages[l]), tuple(self.v_pages[l]))
+                         for l in range(self.num_layers))
+        return tuple(_HPageHistory(tuple(self.h_pages[l]),
+                                   (self.mirror_k[l], self.mirror_v[l]) if verify else None)
                      for l in range(self.num_layers))
+
+    def rollout_history(self):
+        """History for readers WITHOUT gradient: the same pages for "kv", the
+        mirror for "h"."""
+        if self.page_mode == "kv":
+            return self.snapshot_all_layers()
+        return tuple(_MirrorHistory(self.mirror_k[l], self.mirror_v[l], self.num_frames)
+                     for l in range(self.num_layers))
+
+
+class _HPageHistory:
+    """One layer's history of h pages, for a reader with gradient."""
+    __slots__ = ("pages", "verify")
+
+    def __init__(self, pages, verify=None):
+        self.pages, self.verify = pages, verify
+
+
+class _MirrorHistory:
+    """One layer's history as the detached K/V mirror, for a reader without
+    gradient: buffers of max_frames slots, the first m written by writers."""
+    __slots__ = ("k", "v", "m")
+
+    def __init__(self, k, v, m):
+        self.k, self.v, self.m = k, v, m
+
+
+# bitwise check of rebuilt history K/V against the writers' K/V (debug counters)
+PAGE_REBUILD_CHECK = {"checked": 0, "mismatch": 0}
+
+
+def _rope_history(x, grid_sizes, freqs, frames):
+    """causal_rope_apply(x, (frames, h, w), freqs, start_frame=0) for a batch of
+    unpadded sequences that share one grid: the same float64 complex multiply
+    by the same factors, element for element, without that function's
+    per-sample torch.cat and torch.stack copies (two more float64 copies of
+    the whole history per layer). Bitwise the same result and gradient."""
+    b, L, n, d = x.shape
+    c = d // 2
+    f, h, w = frames * int(grid_sizes[0, 0]), int(grid_sizes[0, 1]), int(grid_sizes[0, 2])
+    if f * h * w != L or not bool((grid_sizes == grid_sizes[0]).all()):
+        raise RuntimeError("h pages need one unpadded (f, h, w) grid for the whole batch.")
+    fr = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    freqs_i = torch.cat([fr[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                         fr[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                         fr[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)], dim=-1).reshape(L, 1, -1)
+    xc = torch.view_as_complex(x.to(torch.float64).reshape(b, L, n, -1, 2))
+    return torch.view_as_real(xc * freqs_i).flatten(3).type_as(x)
+
+
+def _rebuild_history_kv(attn, hist, grid_sizes, freqs):
+    """The history K/V of one layer from its h pages, with exactly the ops (and
+    op order, dtype, Memory-LoRA routing) the writers ran on the same h:
+    K = RoPE(norm_k(W_k h + dW_k h)), V = W_v h + dW_v h. A page is a memory
+    write, so (W + dW) applies to every page. One GEMM over the concatenated
+    history instead of one per page, and RoPE over frames 0..m-1 at once
+    instead of at start_frame=j per page: every output row depends only on
+    its own input row, so the result is bitwise the K/V the writers produced
+    (checked on H100 for 1..21 pages, and in situ through `verify`)."""
+    pages = hist.pages
+    m = len(pages)
+    b, s = pages[0].shape[:2]
+    n, d = attn.num_heads, attn.head_dim
+    hh = _PageCat.apply(*pages)
+    kk, vv = attn.k(hh), attn.v(hh)
+    if attn.memory_lora:
+        kk, vv = kk + attn.k_memory_lora(hh), vv + attn.v_memory_lora(hh)
+    k = attn.norm_k(kk).view(b, m * s, n, d)
+    v = vv.view(b, m * s, n, d)
+    k = _rope_history(k, grid_sizes, freqs, m).type_as(v)
+    if hist.verify is not None:
+        with torch.no_grad():
+            mk, mv = hist.verify
+            same = torch.equal(k, mk[:, :m * s]) and torch.equal(v, mv[:, :m * s])
+            PAGE_REBUILD_CHECK["checked"] += 1
+            PAGE_REBUILD_CHECK["mismatch"] += int(not same)
+    return k, v
 
 
 class _PageCat(torch.autograd.Function):
@@ -530,7 +659,7 @@ class CausalWanSelfAttention(nn.Module):
 
     # ======== ours ========
     def forward_persistent(self, x, grid_sizes, freqs, history_k, history_v,
-                           current_start_frame, write_page=False):
+                           current_start_frame, write_page=False, attn_checkpoint=False):
         """Attention over immutable history pages plus this frame's own K/V.
 
         history_k / history_v are tuples of pages (one per earlier frame). They
@@ -538,6 +667,21 @@ class CausalWanSelfAttention(nn.Module):
         saves page references instead of a copy of the whole history.
         Returns y, plus this frame's (k, v) when write_page is set. Pages hold
         post-RoPE K, so a page is interchangeable with a KV-cache slot.
+
+        page_mode "h" (PersistentKVStore): history_k is a _HPageHistory (reader
+        with gradient: the history K/V are rebuilt from the h pages) or a
+        _MirrorHistory (reader without gradient: the detached K/V mirror;
+        this frame's K/V go into slot m of the mirror and the first m + 1
+        slots are read in place, no copy). The page written is (h, k, v): h
+        (this layer's attention input x) when grad is enabled, and the
+        detached k, v for the mirror.
+
+        attn_checkpoint puts the history part (page concatenation or rebuild,
+        and the attention kernel) in its own checkpoint region nested in the
+        block group's: the whole-history K/V the kernel saves for its backward
+        (and, for h pages, the activations of the rebuild) then exist for one
+        layer at a time while the group is backpropagated instead of for every
+        layer of the group, at the price of one more forward of that part.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -548,15 +692,60 @@ class CausalWanSelfAttention(nn.Module):
         v = vv.view(b, s, n, d)
         q_rope = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         k_rope = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-        if len(history_k):
-            k_attn = _PageCat.apply(*history_k, k_rope)
-            v_attn = _PageCat.apply(*history_v, v)
+        h_mode = isinstance(history_k, (_HPageHistory, _MirrorHistory))
+        in_mirror = False
+        if isinstance(history_k, _MirrorHistory):
+            # detached: a reader with gradient here would silently cut the memory gradient
+            if torch.is_grad_enabled():
+                raise RuntimeError("the K/V mirror is for readers without gradient only.")
+            m = history_k.m
+            if m != current_start_frame:
+                raise RuntimeError("the mirror must hold frames 0..m-1.")
+            if m and history_k.k is not None:
+                history_k.k[:, m * s:(m + 1) * s].copy_(k_rope)
+                history_k.v[:, m * s:(m + 1) * s].copy_(v)
+                a = attention(q_rope, history_k.k[:, :(m + 1) * s], history_k.v[:, :(m + 1) * s])
+                in_mirror = True
+            else:
+                a = attention(q_rope, k_rope, v)
         else:
-            k_attn, v_attn = k_rope, v
-        y = self.o(attention(q_rope, k_attn, v_attn).flatten(2))
+            pages = history_k.pages if h_mode else history_k
+            if h_mode and len(pages) != current_start_frame:
+                raise RuntimeError("h pages must be frames 0..m-1 (their RoPE positions).")
+            if not len(pages):
+                a = attention(q_rope, k_rope, v)
+            elif attn_checkpoint and torch.is_grad_enabled():
+                # No early stop: it ends a recomputation by raising from the
+                # last tensor saved, which here is inside flash-attn's Python
+                # autograd Function; raised there, the Function is left in a
+                # reference cycle with its saved whole-history K/V, and those
+                # stay allocated until the cyclic GC runs. The kernel is the
+                # region's last op anyway, so nothing extra is computed.
+                with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                    a = torch.utils.checkpoint.checkpoint(
+                        self._attend_pages, q_rope, k_rope, v, history_k, history_v, grid_sizes, freqs,
+                        use_reentrant=False)
+            else:
+                a = self._attend_pages(q_rope, k_rope, v, history_k, history_v, grid_sizes, freqs)
+        y = self.o(a.flatten(2))
         if write_page:
+            if in_mirror:
+                return y, None, None, None          # already in slot m of the mirror
+            if h_mode:
+                return y, (x if torch.is_grad_enabled() else None), k_rope.detach(), v.detach()
             return y, k_rope, v
         return y
+
+    def _attend_pages(self, q_rope, k_rope, v, history_k, history_v, grid_sizes, freqs):
+        """The attention kernel over (history pages, this frame). K/V pages are
+        concatenated; h pages are first rebuilt into the history K/V."""
+        if isinstance(history_k, _HPageHistory):
+            kh, vh = _rebuild_history_kv(self, history_k, grid_sizes, freqs)
+            k_attn, v_attn = torch.cat([kh, k_rope], dim=1), torch.cat([vh, v], dim=1)
+        else:
+            k_attn = _PageCat.apply(*history_k, k_rope)
+            v_attn = _PageCat.apply(*history_v, v)
+        return attention(q_rope, k_attn, v_attn)
     # ==== ours end ====
 
 
@@ -677,7 +866,8 @@ class CausalWanAttentionBlock(nn.Module):
 
     # ======== ours ========
     def forward_persistent(self, x, e, grid_sizes, freqs, context, context_lens,
-                           history_k, history_v, current_start_frame, write_page=False):
+                           history_k, history_v, current_start_frame, write_page=False,
+                           attn_checkpoint=False):
         """forward() against immutable pages instead of a KV cache, otherwise
         identical. Cross-attention is recomputed rather than cached so the block
         holds no mutable state that a checkpoint recomputation could not replay.
@@ -688,15 +878,16 @@ class CausalWanAttentionBlock(nn.Module):
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             None, grid_sizes, freqs, None,
             persistent=dict(history_k=history_k, history_v=history_v,
-                            current_start_frame=current_start_frame, write_page=write_page))
-        y, new_k, new_v = out if write_page else (out, None, None)
+                            current_start_frame=current_start_frame, write_page=write_page,
+                            attn_checkpoint=attn_checkpoint))
+        y, *page = out if write_page else (out,)     # page: (k, v), or (h, k, v) for h pages
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
         y = self.ffn(
             (self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2))
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[5]).flatten(1, 2)
         if write_page:
-            return x, new_k, new_v
+            return (x, *page)
         return x
     # ==== ours end ====
 
@@ -879,6 +1070,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # KVForcingTrainingPipeline; inference never takes that path.
         self.persistent_block_checkpointing = False
         self.persistent_checkpoint_group = 1
+        # nested checkpoint of each block's history attention
+        # (see CausalWanSelfAttention.forward_persistent)
+        self.persistent_attn_checkpointing = False
         # ==== ours end ====
 
     def _set_gradient_checkpointing(self, module, value=False):
@@ -1451,48 +1645,72 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     # ======== ours ========
     def _embed_frame(self, latent, t, context):
-        """Patchify plus time/text embedding, shared by the two frame forwards."""
+        """Time/text embedding and the patch grid of one frame forward. The
+        patch embedding itself runs inside the first checkpoint region
+        (_run_blocks), so its output is not kept between forward and backward."""
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
-        xs = [self.patch_embedding(u.unsqueeze(0)) for u in latent]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in xs])
-        x = torch.cat([u.flatten(2).transpose(1, 2) for u in xs])
-        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+        p = self.patch_size             # kernel = stride, no padding: the grid is size // patch
+        grid_sizes = torch.stack([torch.tensor([u.shape[1] // p[0], u.shape[2] // p[1], u.shape[3] // p[2]],
+                                               dtype=torch.long) for u in latent])
+        # the dtype of the patch embedding's output (what `type_as(x)` gave)
+        dtype = (torch.get_autocast_dtype(device.type) if torch.is_autocast_enabled(device.type)
+                 else self.patch_embedding.weight.dtype)
+        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype))
         e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-        ctx = self.text_embedding(torch.stack([
-            torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]))
-        return x, grid_sizes, e, e0, ctx
+        if torch.is_tensor(context) and context.dim() == 3 and context.size(1) == self.text_len:
+            # Already [B, text_len, C]: padding and stacking would only copy it.
+            # Used as is, every frame forward of a rollout saves this one tensor
+            # for the text embedding's backward instead of its own copy.
+            padded = context
+        else:
+            padded = torch.stack([
+                torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+        ctx = self.text_embedding(padded)
+        return grid_sizes, e, e0, ctx
 
-    def _run_blocks(self, first, last, x, e0, grid_sizes, ctx, histories, frame_idx, write_page):
+    def _run_blocks(self, first, last, x, e, e0, grid_sizes, ctx, histories, frame_idx, write_page, t_shape):
         """Blocks first..last-1 of one persistent forward. Returns x, then the
-        pages of those blocks (k, v per block) when write_page is set."""
+        pages of those blocks (k, v per block; h, k, v for h pages) when
+        write_page is set. The region that starts at block 0 takes the latent
+        and runs the patch embedding; the region that ends at the last block
+        of a noisy forward runs the head: neither the embedded frame nor the
+        head's input is then kept between forward and backward."""
+        if first == 0:
+            xs = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+            x = torch.cat([u.flatten(2).transpose(1, 2) for u in xs])
         pages = []
         for layer_idx in range(first, last):
-            hk, hv = histories[layer_idx]
+            hist = histories[layer_idx]
+            hk, hv = (hist, None) if isinstance(hist, (_HPageHistory, _MirrorHistory)) else hist
             out = self.blocks[layer_idx](x, e0, None, grid_sizes, self.freqs, ctx, None, None,
                                          persistent=dict(history_k=hk, history_v=hv,
                                                          current_start_frame=frame_idx,
-                                                         write_page=write_page))
+                                                         write_page=write_page,
+                                                         attn_checkpoint=self.persistent_attn_checkpointing))
             if write_page:
-                x, new_k, new_v = out
-                pages.extend([new_k, new_v])
+                x, *page = out
+                pages.extend(page)
             else:
                 x = out
+        if last == len(self.blocks) and not write_page:
+            x = self.head(x, e.unflatten(dim=0, sizes=t_shape).unsqueeze(2))
         return (x, *pages)
 
-    def _persistent_blocks(self, x, e0, grid_sizes, ctx, histories, frame_idx, write_page):
-        """All blocks of one persistent forward, activation-checkpointed in
-        groups of `persistent_checkpoint_group` blocks INSIDE the FSDP unit
-        (the composition PyTorch supports, as _forward_train does). Only the
+    def _persistent_blocks(self, latent, e, e0, grid_sizes, ctx, histories, frame_idx, write_page, t_shape):
+        """One persistent forward from the latent to the head output (noisy) or
+        the pages (write), activation-checkpointed in groups of
+        `persistent_checkpoint_group` blocks INSIDE the FSDP unit (the
+        composition PyTorch supports, as _forward_train does). Only the
         group boundaries are kept between forward and backward: 1 keeps every
         block output, a larger group keeps fewer outputs and recomputes more
         blocks per group. Pages are group outputs, so they are always kept."""
         n, g = len(self.blocks), max(1, int(self.persistent_checkpoint_group))
         ckpt = self.persistent_block_checkpointing and torch.is_grad_enabled()
-        pages = []
+        x, pages = latent, []
         for first in range(0, n, g):
-            args = (first, min(first + g, n), x, e0, grid_sizes, ctx, histories, frame_idx, write_page)
+            args = (first, min(first + g, n), x, e, e0, grid_sizes, ctx, histories, frame_idx, write_page, t_shape)
             out = (torch.utils.checkpoint.checkpoint(self._run_blocks, *args, use_reentrant=False)
                    if ckpt else self._run_blocks(*args))
             x, pages = out[0], pages + list(out[1:])
@@ -1500,16 +1718,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     def forward_noisy_frame(self, latent, t, context, histories, frame_idx):
         """The frame the loss sees: reads the history pages, writes none."""
-        x, grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
-        x, _ = self._persistent_blocks(x, e0, grid_sizes, ctx, histories, frame_idx, write_page=False)
-        x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
+        grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
+        x, _ = self._persistent_blocks(latent, e, e0, grid_sizes, ctx, histories, frame_idx,
+                                       write_page=False, t_shape=t.shape)
         return torch.stack(self.unpatchify(x, grid_sizes))
 
     def forward_clean_writer(self, latent, t, context, histories, frame_idx):
-        """The memory write. Returns this frame's pages as (k0, v0, k1, v1, ...);
-        no head, since a clean frame only provides context."""
-        x, grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
-        _, pages = self._persistent_blocks(x, e0, grid_sizes, ctx, histories, frame_idx, write_page=True)
+        """The memory write. Returns this frame's pages as (k0, v0, k1, v1, ...),
+        or (h0, k0, v0, h1, ...) for h pages; no head, since a clean frame only
+        provides context."""
+        grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
+        _, pages = self._persistent_blocks(latent, e, e0, grid_sizes, ctx, histories, frame_idx,
+                                           write_page=True, t_shape=t.shape)
         return tuple(pages)
     # ==== ours end ====
 
