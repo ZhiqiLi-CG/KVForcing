@@ -1,5 +1,9 @@
 import gc
+import json
 import logging
+import random
+import shutil
+import numpy as np
 from utils.dataset import cycle
 from utils.dataset import TextDataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
@@ -209,6 +213,19 @@ class Trainer:
 
         ##############################################################################################################
 
+        # ======== ours ========
+        # Full-state resume for preemptible partitions. With resume_every > 0 every rank
+        # writes, every resume_every steps, all that the next step depends on (its shards
+        # of the generator and the critic, both optimizers, the EMA, the RNG streams and
+        # the number of batches drawn) to resume_dir, and a restart continues from the
+        # newest complete state. With resume_every == 0 (default) nothing here runs.
+        self.resume_every = max(0, int(getattr(config, "resume_every", 0) or 0))
+        self.resume_dir = str(getattr(config, "resume_dir", "") or "") or os.path.join(str(config.logdir), "resume")
+        self._batches_consumed = 0
+        if self.resume_every > 0:
+            self._load_resume_state()
+        # ==== ours end ====
+
         # Let's delete EMA params for early steps to save some computes at training and inference
         if self.step < config.ema_start_step:
             self.generator_ema = None
@@ -218,6 +235,96 @@ class Trainer:
         self.previous_time = None
         self.step_time_log_interval = max(
             0, int(getattr(config, "step_time_log_interval", 0) or 0))
+
+    # ======== ours ========
+    def _next_batch(self):
+        self._batches_consumed += 1
+        return next(self.dataloader)
+
+    @torch.no_grad()
+    def save_resume_state(self):
+        """Write this rank's part of the training state after `self.step` steps.
+
+        Parameters and optimizer state are saved as the rank's own FSDP shards
+        (use_orig_params=True keeps the original parameters as views of them), so a
+        state can only be loaded with the same number of ranks and wrap policy.
+        The new state is written next to the previous one and swapped in only when
+        every rank has finished, so an interruption at any point leaves a complete state."""
+        tmp, old = self.resume_dir + ".tmp", self.resume_dir + ".old"
+        if self.is_main_process:
+            shutil.rmtree(tmp, ignore_errors=True)
+            os.makedirs(tmp, exist_ok=True)
+        dist.barrier()
+        rank = dist.get_rank()
+        state = {
+            "step": self.step, "world_size": self.world_size, "rank": rank,
+            "batches_consumed": self._batches_consumed,
+            "generator": {n: p.detach().cpu().clone() for n, p in self.model.generator.named_parameters()},
+            "critic": {n: p.detach().cpu().clone() for n, p in self.model.fake_score.named_parameters()},
+            "generator_optimizer": self.generator_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "generator_ema": None if self.generator_ema is None else self.generator_ema.state_dict(),
+            "rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(self.device),
+                    "python": random.getstate(), "numpy": np.random.get_state()},
+        }
+        torch.save(state, os.path.join(tmp, f"rank{rank}.pt"))
+        del state
+        dist.barrier()
+        if self.is_main_process:
+            with open(os.path.join(tmp, "COMPLETE"), "w") as f:
+                json.dump({"step": self.step, "world_size": self.world_size}, f)
+            shutil.rmtree(old, ignore_errors=True)
+            if os.path.isdir(self.resume_dir):
+                os.replace(self.resume_dir, old)
+            os.replace(tmp, self.resume_dir)
+            print(f"[resume] state after step {self.step} saved to {self.resume_dir}", flush=True)
+        dist.barrier()
+
+    def _load_resume_state(self):
+        """Continue from the newest complete state in resume_dir, if there is one."""
+        found = []
+        for d in (self.resume_dir, self.resume_dir + ".tmp", self.resume_dir + ".old"):
+            marker = os.path.join(d, "COMPLETE")
+            if os.path.exists(marker):
+                with open(marker) as f:
+                    found.append((int(json.load(f)["step"]), d))
+        if not found:
+            if self.is_main_process:
+                print(f"[resume] no saved state in {self.resume_dir}: starting from step 0", flush=True)
+            return
+        step, d = max(found)
+        rank = dist.get_rank()
+        state = torch.load(os.path.join(d, f"rank{rank}.pt"), map_location="cpu", weights_only=False)
+        assert state["step"] == step and state["rank"] == rank and state["world_size"] == self.world_size, (
+            f"[resume] {d}: saved for step {state['step']} rank {state['rank']} of {state['world_size']}, "
+            f"this is rank {rank} of {self.world_size}")
+        for key, module in (("generator", self.model.generator), ("critic", self.model.fake_score)):
+            saved = state[key]
+            assert [n for n, _ in module.named_parameters()] == list(saved), f"[resume] parameter names of the {key} differ"
+            for n, p in module.named_parameters():
+                assert p.shape == saved[n].shape, f"[resume] {key} {n}: shard {tuple(p.shape)} vs saved {tuple(saved[n].shape)}"
+                p.data.copy_(saved[n].to(device=p.device, dtype=p.dtype))
+        self.generator_optimizer.load_state_dict(state["generator_optimizer"])
+        self.critic_optimizer.load_state_dict(state["critic_optimizer"])
+        if state["generator_ema"] is not None:
+            if self.generator_ema is None:
+                self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+            self.generator_ema.load_state_dict(state["generator_ema"])
+        self.step = int(state["step"])
+        # same prompts as the uninterrupted run: the sampler's order does not depend on the RNG restored below
+        for _ in range(int(state["batches_consumed"])):
+            next(self.dataloader)
+        self._batches_consumed = int(state["batches_consumed"])
+        rng = state["rng"]
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"])
+        torch.cuda.set_rng_state(rng["cuda"], self.device)
+        del state
+        if self.is_main_process:
+            print(f"[resume] continuing after step {self.step} from {d} "
+                  f"({self._batches_consumed} batches already drawn)", flush=True)
+    # ==== ours end ====
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -356,7 +463,7 @@ class Trainer:
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 
-                batch = next(self.dataloader)
+                batch = self._next_batch()
                 generator_log_dict = self.fwdbwd_one_step(batch, True)
 
                 self.generator_optimizer.step()
@@ -368,7 +475,7 @@ class Trainer:
 
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
-            batch = next(self.dataloader)
+            batch = self._next_batch()
             critic_log_dict = self.fwdbwd_one_step(batch, False)
                 
             self.critic_optimizer.step()
@@ -431,6 +538,11 @@ class Trainer:
                     logging.info("DistGarbageCollector: Running GC.")
                 gc.collect()
                 torch.cuda.empty_cache()
+
+            # ======== ours ========
+            if self.resume_every > 0 and self.step % self.resume_every == 0 and not (max_steps > 0 and self.step >= max_steps):
+                self.save_resume_state()
+            # ==== ours end ====
 
             if self.is_main_process:
                 current_time = time.time()

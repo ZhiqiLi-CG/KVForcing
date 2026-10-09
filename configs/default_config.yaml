@@ -42,3 +42,8 @@ num_samples: 1
 height: 480
 width: 832
 num_frames: 81
+# Full-state resume (trainer/distillation.py): every resume_every steps each rank saves its shards of the generator,
+# the critic, both optimizers, the EMA and its RNG streams to resume_dir (default <logdir>/resume), and a restart with
+# the same logdir continues from there. 0 disables it (a restart then begins at step 0).
+resume_every: 0
+resume_dir: ''
