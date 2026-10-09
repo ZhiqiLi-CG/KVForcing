@@ -174,6 +174,37 @@ class _PageCat(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         return tuple(g.contiguous().clone() for g in grad.split(ctx.sizes, dim=1))
+
+
+class _PageCatPair(torch.autograd.Function):
+    """_PageCat for the fused frame forward (CausalWanModel.forward_fused_frame),
+    whose batch is [noisy; write]: both halves read the same history pages and
+    each appends its own K (or V). Returns the tensor whose first half is
+    cat(history, own_noisy) and second half cat(history, own_write). The
+    backward sums the two halves' history gradient page by page into fresh
+    contiguous tensors and hands the own parts contiguous copies too, for the
+    reason _PageCat gives.
+    """
+
+    @staticmethod
+    def forward(ctx, own_noisy, own_write, *pages):
+        ctx.sizes = [p.shape[1] for p in pages]
+        b, lh = own_noisy.shape[0], sum(ctx.sizes)
+        out = own_noisy.new_empty((2 * b, lh + own_noisy.shape[1], *own_noisy.shape[2:]))
+        torch.cat([*pages, own_noisy], dim=1, out=out[:b])
+        if pages:
+            out[b:, :lh].copy_(out[:b, :lh])
+        out[b:, lh:].copy_(own_write)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        b, lh, page_grads, a = grad.shape[0] // 2, sum(ctx.sizes), [], 0
+        for s in ctx.sizes:
+            page_grads.append(grad[:b, a:a + s] + grad[b:, a:a + s])
+            a += s
+        return (grad[:b, lh:].clone(memory_format=torch.contiguous_format),
+                grad[b:, lh:].clone(memory_format=torch.contiguous_format), *page_grads)
 # ==== ours end ====
 
 
@@ -530,7 +561,7 @@ class CausalWanSelfAttention(nn.Module):
 
     # ======== ours ========
     def forward_persistent(self, x, grid_sizes, freqs, history_k, history_v,
-                           current_start_frame, write_page=False):
+                           current_start_frame, write_page=False, write_mask=None):
         """Attention over immutable history pages plus this frame's own K/V.
 
         history_k / history_v are tuples of pages (one per earlier frame). They
@@ -538,7 +569,11 @@ class CausalWanSelfAttention(nn.Module):
         saves page references instead of a copy of the whole history.
         Returns y, plus this frame's (k, v) when write_page is set. Pages hold
         post-RoPE K, so a page is interchangeable with a KV-cache slot.
+        A write_mask marks the fused [noisy; write] batch (forward_persistent_pair).
         """
+        if write_mask is not None:
+            return self.forward_persistent_pair(x, grid_sizes, freqs, history_k, history_v,
+                                                current_start_frame, write_mask)
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         kk, vv = self.k(x), self.v(x)
@@ -557,6 +592,35 @@ class CausalWanSelfAttention(nn.Module):
         if write_page:
             return y, k_rope, v
         return y
+
+    def forward_persistent_pair(self, x, grid_sizes, freqs, history_k, history_v,
+                                current_start_frame, write_mask):
+        """forward_persistent of the batch [noisy; write] in one call: the first
+        half is the noisy forward, the second half the page write; both attend
+        to the same pages plus their OWN K/V, never to each other's. write_mask
+        (0 for the noisy half, 1 for the write half) confines Memory-LoRA to the
+        write (+ 0 leaves the noisy half exact). Returns y and the write's
+        (k, v) page. RoPE runs per half (it loops over samples anyway), so the
+        K page is a fresh tensor; the V page is copied out of the fused
+        projection, which a view would pin.
+        """
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        h = b // 2
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        kk, vv = self.k(x), self.v(x)
+        if self.memory_lora:
+            kk = kk + self.k_memory_lora(x) * write_mask
+            vv = vv + self.v_memory_lora(x) * write_mask
+        k_noisy, k_write = self.norm_k(kk).view(b, s, n, d).split(h)
+        v_noisy, v_write = vv.view(b, s, n, d).split(h)
+        v_write = v_write.clone()
+        q_rope = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(vv)
+        k_noisy = causal_rope_apply(k_noisy, grid_sizes[:h], freqs, start_frame=current_start_frame).type_as(vv)
+        k_write = causal_rope_apply(k_write, grid_sizes[h:], freqs, start_frame=current_start_frame).type_as(vv)
+        k_attn = _PageCatPair.apply(k_noisy, k_write, *history_k)
+        v_attn = _PageCatPair.apply(v_noisy, v_write, *history_v)
+        y = self.o(attention(q_rope, k_attn, v_attn).flatten(2))
+        return y, k_write, v_write
     # ==== ours end ====
 
 
@@ -677,10 +741,12 @@ class CausalWanAttentionBlock(nn.Module):
 
     # ======== ours ========
     def forward_persistent(self, x, e, grid_sizes, freqs, context, context_lens,
-                           history_k, history_v, current_start_frame, write_page=False):
+                           history_k, history_v, current_start_frame, write_page=False,
+                           write_mask=None):
         """forward() against immutable pages instead of a KV cache, otherwise
         identical. Cross-attention is recomputed rather than cached so the block
         holds no mutable state that a checkpoint recomputation could not replay.
+        With write_mask, x is the fused [noisy; write] batch (write_page is set).
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
@@ -688,7 +754,8 @@ class CausalWanAttentionBlock(nn.Module):
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             None, grid_sizes, freqs, None,
             persistent=dict(history_k=history_k, history_v=history_v,
-                            current_start_frame=current_start_frame, write_page=write_page))
+                            current_start_frame=current_start_frame, write_page=write_page,
+                            write_mask=write_mask))
         y, new_k, new_v = out if write_page else (out, None, None)
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
@@ -1439,7 +1506,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # gathered and cast; a bare method call would see them still sharded.
         mode = kwargs.pop("persistent_mode", None)
         if mode is not None:
-            fn = self.forward_clean_writer if mode == "write" else self.forward_noisy_frame
+            fn = {"write": self.forward_clean_writer, "noisy": self.forward_noisy_frame,
+                  "fused": self.forward_fused_frame}[mode]
             return fn(args[0], kwargs["t"], kwargs["context"],
                       kwargs["persistent_history"], kwargs.get("persistent_start", 0))
         # ==== ours end ====
@@ -1458,13 +1526,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         xs = [self.patch_embedding(u.unsqueeze(0)) for u in latent]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in xs])
         x = torch.cat([u.flatten(2).transpose(1, 2) for u in xs])
-        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+        e, e0 = self._embed_time(t, x)
         ctx = self.text_embedding(torch.stack([
             torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]))
         return x, grid_sizes, e, e0, ctx
 
-    def _run_blocks(self, first, last, x, e0, grid_sizes, ctx, histories, frame_idx, write_page):
+    def _embed_time(self, t, x):
+        """Time embedding of t ([B, F]) and its projection onto the blocks' modulation."""
+        e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+        return e, self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+
+    def _run_blocks(self, first, last, x, e0, grid_sizes, ctx, histories, frame_idx, write_page,
+                    write_mask=None):
         """Blocks first..last-1 of one persistent forward. Returns x, then the
         pages of those blocks (k, v per block) when write_page is set."""
         pages = []
@@ -1473,7 +1546,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             out = self.blocks[layer_idx](x, e0, None, grid_sizes, self.freqs, ctx, None, None,
                                          persistent=dict(history_k=hk, history_v=hv,
                                                          current_start_frame=frame_idx,
-                                                         write_page=write_page))
+                                                         write_page=write_page,
+                                                         write_mask=write_mask))
             if write_page:
                 x, new_k, new_v = out
                 pages.extend([new_k, new_v])
@@ -1481,7 +1555,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 x = out
         return (x, *pages)
 
-    def _persistent_blocks(self, x, e0, grid_sizes, ctx, histories, frame_idx, write_page):
+    def _persistent_blocks(self, x, e0, grid_sizes, ctx, histories, frame_idx, write_page,
+                           write_mask=None):
         """All blocks of one persistent forward, activation-checkpointed in
         groups of `persistent_checkpoint_group` blocks INSIDE the FSDP unit
         (the composition PyTorch supports, as _forward_train does). Only the
@@ -1492,7 +1567,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         ckpt = self.persistent_block_checkpointing and torch.is_grad_enabled()
         pages = []
         for first in range(0, n, g):
-            args = (first, min(first + g, n), x, e0, grid_sizes, ctx, histories, frame_idx, write_page)
+            args = (first, min(first + g, n), x, e0, grid_sizes, ctx, histories, frame_idx, write_page,
+                    write_mask)
             out = (torch.utils.checkpoint.checkpoint(self._run_blocks, *args, use_reentrant=False)
                    if ckpt else self._run_blocks(*args))
             x, pages = out[0], pages + list(out[1:])
@@ -1511,6 +1587,29 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x, grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
         _, pages = self._persistent_blocks(x, e0, grid_sizes, ctx, histories, frame_idx, write_page=True)
         return tuple(pages)
+
+    def forward_fused_frame(self, latent, t, context, histories, frame_idx):
+        """forward_noisy_frame and forward_clean_writer as ONE forward of the
+        batch [noisy; write] (latent and t are the two concatenated; context is
+        the unrepeated text). Both halves read the same pages and neither reads
+        the other's K/V, so every forward, recompute and backward of the pair
+        is one call. Returns (the noisy half's prediction, the write half's
+        pages). The halves reproduce the two separate forwards bit for bit:
+        the patch embedding and RoPE loop over samples, and the token GEMMs,
+        norms and flash-attn are batch-invariant (checked on H100, bf16 and
+        fp32/TF32). Two things are not and are kept per half: the time
+        embedding (in fp32 a 1-row GEMM takes another kernel than a 2-row one),
+        and the text, embedded once and copied (a stride-0 expanded context
+        takes another GEMM path in cross-attention)."""
+        h = latent.shape[0] // 2
+        x, grid_sizes, e, e0, ctx = self._embed_frame(latent, t[:h], context)
+        e0 = torch.cat([e0, self._embed_time(t[h:], x)[1]])
+        ctx = torch.cat([ctx, ctx])
+        write_mask = (torch.arange(2 * h, device=x.device) >= h).to(x.dtype).view(2 * h, 1, 1)
+        x, pages = self._persistent_blocks(x, e0, grid_sizes, ctx, histories, frame_idx,
+                                           write_page=True, write_mask=write_mask)
+        x = self.head(x[:h], e.unflatten(dim=0, sizes=t[:h].shape).unsqueeze(2))
+        return torch.stack(self.unpatchify(x, grid_sizes[:h])), tuple(pages)
     # ==== ours end ====
 
     def unpatchify(self, x, grid_sizes):

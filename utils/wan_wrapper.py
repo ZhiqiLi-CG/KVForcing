@@ -270,6 +270,13 @@ class WanDiffusionWrapper(torch.nn.Module):
             frame = noisy_image_or_video.permute(0, 2, 1, 3, 4)
             if persistent_mode == "write":
                 return self.model(frame, **call)      # pages, not a prediction
+            if persistent_mode == "fused":            # batch [noisy; write]: (x0 of noisy, pages of write)
+                half = noisy_image_or_video.shape[0] // 2
+                flow_pred, pages = self.model(frame, **call)
+                flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
+                return self._convert_flow_pred_to_x0(
+                    flow_pred=flow_pred.flatten(0, 1), xt=noisy_image_or_video[:half].flatten(0, 1),
+                    timestep=timestep[:half].flatten(0, 1)).unflatten(0, flow_pred.shape[:2]), pages
             assert persistent_mode == "noisy", persistent_mode
             flow_pred = self.model(frame, **call).permute(0, 2, 1, 3, 4)
         elif kv_cache is not None:  # upstream's `if`, continued unchanged below
