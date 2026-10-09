@@ -39,6 +39,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
 parser.add_argument("--checkpoint_path", type=str, help="Path to the checkpoint folder")
 parser.add_argument("--data_path", type=str, help="Path to the dataset")
+# ======== ours ========
+parser.add_argument("--extended_prompt_path", type=str, default=None,
+                    help="Line-aligned file of extended prompts. Videos are GENERATED from these and NAMED after the "
+                         "prompts of --data_path. The model is trained on long LLM-extended prompts only, so short "
+                         "benchmark prompts (VBench) must be extended; this is the option of the official "
+                         "Self-Forcing inference.py.")
+# ==== ours end ====
 parser.add_argument("--output_folder", type=str, help="Output folder")
 parser.add_argument("--num_output_frames", type=int, default=21, help="Number of overlap frames between sliding windows")
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
@@ -62,6 +69,14 @@ parser.add_argument("--kv_cache_position_mode", type=str, default="top_aligned",
                     choices=("top_aligned", "contiguous"),
                     help="(long video) RoPE index policy for cached frames. top_aligned keeps the previous sink+tail geometry; contiguous maps the retained cache to 0..N-1, so sink=0/local=12 freezes at 0..11.")
 args = parser.parse_args()
+
+# ======== ours ========
+if not args.long_video and args.num_output_frames > args.kv_cache_train_frames:
+    # Without --long_video the cached keys carry absolute RoPE positions; past the trained clip length they leave
+    # the range the model has seen. scripts/infer.sh and scripts/eval/sample_for_vbench.sh always pass --long_video.
+    print(f"[WARN] {args.num_output_frames} latent frames without --long_video: temporal positions beyond "
+          f"{args.kv_cache_train_frames - 1} were never trained. Pass --long_video (see scripts/infer.sh).")
+# ==== ours end ====
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
@@ -133,7 +148,9 @@ if args.i2v:
     ])
     dataset = TextImagePairDataset(args.data_path, transform=transform)
 else:
-    dataset = TextDataset(prompt_path=args.data_path)
+    # ======== ours ========  (upstream Self-Forcing passes the extended prompts here)
+    dataset = TextDataset(prompt_path=args.data_path, extended_prompt_path=args.extended_prompt_path)
+    # ==== ours end ====
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
