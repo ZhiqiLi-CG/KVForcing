@@ -609,8 +609,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         kv_cache_pos = []
         kv_cache_neg = []
         if self.local_attn_size != -1:
-            # Use the local attention size to compute the KV cache size
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
+            # ======== ours ========
+            # sink frames + local window, see CausalInferencePipeline._initialize_kv_cache
+            sink_size = getattr(self.generator.model, "sink_size", 0)
+            kv_cache_size = (self.local_attn_size + sink_size) * self.frame_seq_length
+            # ==== ours end ====
         else:
             # Use the default KV cache size
             kv_cache_size = 32760
