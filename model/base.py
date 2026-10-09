@@ -229,6 +229,18 @@ class SelfForcingModel(BaseModel):
         return self.inference_pipeline.inference_with_trajectory(
             noise=noise,clean_image_or_video=clean_image_or_video, **conditional_dict
         )
+    # ======== ours ========
+    def _kv_forcing_page_mode(self):
+        """kv_forcing_page_mode, refused outside bf16 mixed precision for "h":
+        with fp32 weights the h-page rebuild is no longer bitwise the writers'
+        K/V (one GEMM over the history rounds differently from one per page),
+        and the rollout then drifts from the K/V-page one."""
+        page_mode = getattr(self.args, "kv_forcing_page_mode", "kv")
+        if page_mode == "h" and not self.args.mixed_precision:
+            raise ValueError("kv_forcing_page_mode: h requires mixed_precision: true (bf16).")
+        return page_mode
+    # ==== ours end ====
+
     def _initialize_inference_pipeline(self):
         """
         Lazy initialize the inference pipeline during the first backward simulation run.
@@ -250,6 +262,8 @@ class SelfForcingModel(BaseModel):
                 cache_mode=getattr(self.args, "cache_mode", "exit"),
                 gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
                 checkpoint_group=getattr(self.args, "kv_forcing_checkpoint_group", 1),
+                fuse_grad_forwards=getattr(self.args, "kv_forcing_fuse_grad_forwards", False),
+                page_mode=self._kv_forcing_page_mode(),
             )
             return
         # ==== ours end ====

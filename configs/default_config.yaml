@@ -21,6 +21,14 @@ match_context: true
 # kv_forcing: blocks per activation-checkpoint region (1 = every block; larger trades
 # recomputation memory for fewer kept block outputs, numerically identical)
 kv_forcing_checkpoint_group: 5
+# kv_forcing options that keep the forward bitwise and only reorder additions in the
+# backward pass (docs/kv_forcing.md); off, the step is bitwise the plain one.
+#   fuse_grad_forwards: the noisy and the write forward of a frame as one batch-2 forward
+#     (a faster generator step, for about 2 GiB more)
+#   page_mode: kv | h. h keeps the writer's attention input instead of (K, V) as the page
+#     that carries the graph: a lower generator-step peak. bf16 (mixed_precision: true) only.
+kv_forcing_fuse_grad_forwards: false
+kv_forcing_page_mode: kv
 # with mixed_precision false, still run the frozen teacher (real_score) in bf16
 real_score_bf16: false
 # ==== ours end ====
