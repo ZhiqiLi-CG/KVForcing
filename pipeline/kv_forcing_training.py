@@ -130,38 +130,47 @@ class KVForcingTrainingPipeline:
         num_denoising_steps = len(self.denoising_step_list)
         if self.cache_mode == "exit" and self.per_rank_exit_step:
             idx = int(torch.randint(low=0, high=num_denoising_steps, size=(1,), device=device).item())
+            if self.last_step_only:
+                idx = num_denoising_steps - 1
         else:
             idx = int(self.generate_and_sync_list(1, num_denoising_steps, device)[0])
-        train_t = self.denoising_step_list[idx]
 
         model.persistent_block_checkpointing = self.gradient_checkpointing
         model.persistent_checkpoint_group = self.checkpoint_group
-        store = PersistentKVStore(len(model.blocks))
+        # one page-table slot per page; the last block writes none (see below)
+        store = PersistentKVStore(len(model.blocks), max_frames=num_frames - self.num_frame_per_block)
         outputs = []
         start = 0
         for _ in range(num_blocks):
             n = self.num_frame_per_block
             hist = store.snapshot_all_layers()
 
-            # The rollout: no gradient, exactly as at inference.
-            with torch.no_grad():
-                noisy_input = noise[:, start:start + n]
-                noisy_at_t = x0_exit = None
-                for index, current_timestep in enumerate(self.denoising_step_list):
-                    timestep = torch.ones([batch_size, n], device=device, dtype=torch.int64) * current_timestep
-                    if index == idx:
-                        noisy_at_t = noisy_input
-                    x0 = self._noisy(noisy_input, timestep, conditional_dict, hist, start)
-                    if index == idx:
-                        x0_exit = x0
-                        if self.cache_mode == "exit" and not self.per_rank_exit_step:
-                            break
-                    if index < num_denoising_steps - 1:
+            # The rollout, exactly as at inference. The exit-step forward is
+            # the one the loss sees, so it is the only one run with gradient
+            # (when the caller allows it): its prediction is both the output
+            # and, detached, the rollout's x0 at that step. Under no_grad
+            # (DMD's critic step) the rollout alone gives the output.
+            noisy_input = noise[:, start:start + n]
+            x0_exit = None
+            for index, current_timestep in enumerate(self.denoising_step_list):
+                timestep = torch.ones([batch_size, n], device=device, dtype=torch.int64) * current_timestep
+                if index == idx:
+                    out = self._noisy(noisy_input, timestep, conditional_dict, hist, start)
+                    outputs.append(out)
+                    x0 = x0_exit = out.detach()
+                    if self.cache_mode == "exit" and not self.per_rank_exit_step:
+                        break
+                else:
+                    with torch.no_grad():
+                        x0 = self._noisy(noisy_input, timestep, conditional_dict, hist, start)
+                if index < num_denoising_steps - 1:
+                    with torch.no_grad():
                         noisy_input = self.scheduler.add_noise(
                             x0.flatten(0, 1), torch.randn_like(x0.flatten(0, 1)),
                             self.denoising_step_list[index + 1] * torch.ones(
                                 [batch_size * n], device=device, dtype=torch.long),
                         ).unflatten(0, x0.shape[:2])
+            with torch.no_grad():
                 x0_cache = x0 if self.cache_mode == "final_clean" else x0_exit
                 context_timestep = torch.ones_like(timestep) * self.context_noise
                 x_ctx = self.scheduler.add_noise(
@@ -169,17 +178,17 @@ class KVForcingTrainingPipeline:
                     context_timestep.flatten(0, 1).long(),
                 ).unflatten(0, x0_cache.shape[:2])
 
-            # The two differentiable forwards: the block at its training
-            # timestep, and the memory write that becomes this block's pages.
-            tf_t = torch.ones([batch_size, n], device=device, dtype=torch.int64) * train_t
-            outputs.append(self._noisy(noisy_at_t, tf_t, conditional_dict, hist, start))
+            # The memory write that becomes this block's pages. No block reads
+            # the last block's pages, so it writes none.
             if self.match_context:
                 write_x, write_t = x_ctx, context_timestep
             else:
                 write_x, write_t = x0_cache, torch.zeros_like(context_timestep)
-            store.append_all_layers(self._write(write_x, write_t, conditional_dict, hist, start))
+            if start + n < num_frames:
+                store.append_all_layers(self._write(write_x, write_t, conditional_dict, hist, start))
             start += n
 
+        store.end_rollout()
         output = torch.cat(outputs, dim=1)
 
         # The timestep window the sampled exit step corresponds to, for DMD.

@@ -16,6 +16,9 @@ import torch.nn as nn
 import torch
 # ======== ours ========
 import torch.utils.checkpoint
+from typing import NamedTuple
+from wan.modules import attention as _attention_backend
+from wan.modules.model import WanT2VCrossAttention
 # ==== ours end ====
 import math
 import torch.distributed as dist
@@ -128,6 +131,64 @@ class MemoryLoRA(nn.Module):
 
 
 # ======== ours ========
+def _attn_dtype(dtype):
+    """The dtype attention() hands flash-attn for inputs of `dtype`."""
+    return dtype if dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+
+
+class _PageTable:
+    """One layer's contiguous page table: K and V buffers [B, max_frames * L, n, d]
+    in which the page of frame i occupies rows [i * L, (i + 1) * L). Allocated on
+    first use and only ever appended to, in the dtype flash-attn computes in.
+    It also keeps the layer's cross-attention K/V of the prompt for the forwards
+    without gradient (the inference path's crossattn_cache, per rollout).
+    """
+
+    def __init__(self, max_frames):
+        self.max_frames = max_frames
+        self.k = self.v = None
+        self.context_kv = None
+
+    def put(self, slot, k, v):
+        """Writes k, v [B, L, n, d] into the slot of frame `slot` and returns the
+        slot's views."""
+        L = k.shape[1]
+        if self.k is None:
+            shape = (k.shape[0], self.max_frames * L, *k.shape[2:])
+            self.k = k.new_empty(shape, dtype=_attn_dtype(k.dtype))
+            self.v = v.new_empty(shape, dtype=_attn_dtype(v.dtype))
+        k_slot, v_slot = self.k[:, slot * L:(slot + 1) * L], self.v[:, slot * L:(slot + 1) * L]
+        if k.data_ptr() != k_slot.data_ptr():       # else k is this slot already
+            k_slot.copy_(k)
+        if v.data_ptr() != v_slot.data_ptr():
+            v_slot.copy_(v)
+        return k_slot, v_slot
+
+
+class _PageHandle(torch.autograd.Function):
+    """A page's place in the autograd graph, without its data: an expanded
+    scalar of the page's shape and dtype, through which the page's gradient
+    passes unchanged. The data is in the page table."""
+
+    @staticmethod
+    def forward(ctx, page):
+        return page.new_zeros(()).expand(page.shape)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+class PageRead(NamedTuple):
+    """One layer's history as a forward is handed it: the layer's page table,
+    the number of pages in it, and the handles of those pages that carry a
+    graph."""
+    table: _PageTable
+    length: int
+    k_handles: tuple
+    v_handles: tuple
+
+
 class PersistentKVStore:
     """Immutable K/V pages written by the KV Forcing rollout.
 
@@ -135,45 +196,145 @@ class PersistentKVStore:
     autoregressive KV cache overwrites a slot in place; a page is never
     modified, so it can carry a graph, and a checkpointed frame recomputes
     against exactly the history it saw at forward time.
+
+    The pages of a layer are the slots of one contiguous page table
+    (_PageTable), written once, when the page is appended, in the dtype
+    attention() converts K/V to anyway. A page that carries a graph keeps its
+    place in it through a handle (_PageHandle).
+
+    A forward with gradient concatenates [history slots | own K/V] and routes
+    the history's gradient to the handles (_PageCat). A forward WITHOUT
+    gradient (the rollout's other denoising steps, and every forward of DMD's
+    critic step) reads the history in place: frame i writes its own K/V into
+    slot i, which is scratch until its page is appended, and attends to
+    table[:, :(i + 1) * L]; a frame beyond the table's last slot (the last
+    frame, which writes no page) concatenates like a forward with gradient.
+    Either way flash-attn is given bitwise the K/V it would be given if every
+    page were its own tensor. Slots 0..i-1 never change once written, so the
+    recomputation of a checkpointed frame reads the history it saw at forward
+    time.
     """
 
-    def __init__(self, num_layers):
+    def __init__(self, num_layers, max_frames):
         self.num_layers = num_layers
-        self.k_pages = [[] for _ in range(num_layers)]
-        self.v_pages = [[] for _ in range(num_layers)]
+        self.tables = [_PageTable(max_frames) for _ in range(num_layers)]
+        self.k_handles = [[] for _ in range(num_layers)]
+        self.v_handles = [[] for _ in range(num_layers)]
+        self.length = 0
 
     def __len__(self):
-        return len(self.k_pages[0])
+        return self.length
 
     def append_all_layers(self, flat_pages):
         """flat_pages is (k0, v0, k1, v1, ...), the writer's flattened output."""
         for layer_idx in range(self.num_layers):
-            self.k_pages[layer_idx].append(flat_pages[2 * layer_idx])
-            self.v_pages[layer_idx].append(flat_pages[2 * layer_idx + 1])
+            k, v = flat_pages[2 * layer_idx], flat_pages[2 * layer_idx + 1]
+            with torch.no_grad():
+                self.tables[layer_idx].put(self.length, k, v)
+            if k.requires_grad:
+                self.k_handles[layer_idx].append(_PageHandle.apply(k))
+                self.v_handles[layer_idx].append(_PageHandle.apply(v))
+        self.length += 1
 
     def snapshot_all_layers(self):
-        """Tuples of page references; appending later cannot change a snapshot."""
-        return tuple((tuple(self.k_pages[l]), tuple(self.v_pages[l]))
+        """A PageRead per layer; appending later cannot change a snapshot."""
+        return tuple(PageRead(self.tables[l], self.length, tuple(self.k_handles[l]), tuple(self.v_handles[l]))
                      for l in range(self.num_layers))
+
+    def end_rollout(self):
+        """Drops the prompt K/V the forwards without gradient shared. The pages
+        stay: the graph holds their tables until the backward pass is done."""
+        for table in self.tables:
+            table.context_kv = None
 
 
 class _PageCat(torch.autograd.Function):
-    """torch.cat over the history pages whose backward hands each page a
-    CONTIGUOUS gradient. cat's own backward returns views into the one big
-    dK/dV buffer of the whole history; a page's first gradient contribution is
-    stored as that view, which pins the entire buffer (30 layers x K,V x the
-    whole history) until the page is consumed. Cloning the slices costs one
-    transient copy and frees the buffer at once. Numerically identical.
+    """[history | own] for a forward with gradient. `history` is the table's
+    view of the pages, in the dtype flash-attn computes in; `own` is cast to
+    it. The backward hands each page's handle its slice of the gradient, cast
+    back and CONTIGUOUS: views into the one big dK/dV buffer of the whole
+    history, which is what cat's own backward returns, would be stored as a
+    page's first gradient contribution and pin the entire buffer (30 layers x
+    K,V x the whole history) until the page is consumed. The copies free the
+    buffer at once. Numerically identical to cat, convert, and its backward.
     """
 
     @staticmethod
-    def forward(ctx, *pages):
-        ctx.sizes = [p.shape[1] for p in pages]
-        return torch.cat(pages, dim=1)
+    def forward(ctx, history, own, *handles):
+        ctx.sizes = [h.shape[1] for h in handles]
+        ctx.split = history.shape[1]
+        ctx.dtype = own.dtype
+        return torch.cat([history, own.to(history.dtype)], dim=1)
 
     @staticmethod
     def backward(ctx, grad):
-        return tuple(g.contiguous().clone() for g in grad.split(ctx.sizes, dim=1))
+        def owned(g):
+            return g.to(ctx.dtype, copy=True, memory_format=torch.contiguous_format)
+        pages = grad[:, :ctx.split].split(ctx.sizes, dim=1) if ctx.sizes else ()
+        return (None, owned(grad[:, ctx.split:]), *(owned(g) for g in pages))
+
+
+def _rope_table(freqs, grid_sizes, start_frame):
+    """The multiplier causal_rope_apply builds on every call, [L, 1, c] complex128,
+    for a frame grid at absolute frame `start_frame` (every sample has the same
+    grid). Built once per persistent forward and shared by all its layers."""
+    f, h, w = grid_sizes[0].tolist()
+    c = freqs.size(1)
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    return torch.cat([
+        freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1)
+
+
+def _rope_apply(x, rope):
+    """causal_rope_apply for x [B, L, n, d] whose L tokens are the grid of `rope`
+    (_rope_table): the same float64 complex product, without the table rebuilt
+    per call and without the cat with an empty tail and the stack, which copy
+    the float64 result twice. Bitwise the same output and input gradient."""
+    b, s, n, _ = x.shape
+    x_c = torch.view_as_complex(x.to(torch.float64).reshape(b, s, n, -1, 2))
+    return torch.view_as_real(x_c * rope).flatten(3).type_as(x)
+
+
+_CU_SEQLENS = {}
+
+
+def _cu_seqlens(b, length, device):
+    key = (b, length, device)
+    if key not in _CU_SEQLENS:
+        _CU_SEQLENS[key] = torch.arange(0, (b + 1) * length, length, dtype=torch.int32, device=device)
+    return _CU_SEQLENS[key]
+
+
+def _flash_attention(q, k, v):
+    """attention(q, k, v) for unpadded sequences (q_lens = k_lens = None): the
+    same flash-attn call on the same arguments. attention() builds the two
+    cu_seqlens on every call (two host-to-device copies and, on the GPU, two
+    fills, two cats and two cumsums); here they are built once per
+    (batch, length)."""
+    fa = _attention_backend
+    if not (fa.FLASH_ATTN_2_AVAILABLE or fa.FLASH_ATTN_3_AVAILABLE):
+        return attention(q, k, v)
+    b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+
+    def half(x):
+        return x if x.dtype in (torch.float16, torch.bfloat16) else x.to(torch.bfloat16)
+
+    q, k, v = half(q.flatten(0, 1)), half(k.flatten(0, 1)), half(v.flatten(0, 1))
+    q, k = q.to(v.dtype), k.to(v.dtype)
+    cu_q, cu_k = _cu_seqlens(b, lq, q.device), _cu_seqlens(b, lk, q.device)
+    if fa.FLASH_ATTN_3_AVAILABLE:
+        x = fa.flash_attn_interface.flash_attn_varlen_func(
+            q=q, k=k, v=v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=lq, max_seqlen_k=lk,
+            softmax_scale=None, causal=False, deterministic=False)[0].unflatten(0, (b, lq))
+    else:
+        x = fa.flash_attn.flash_attn_varlen_func(
+            q=q, k=k, v=v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=lq, max_seqlen_k=lk,
+            dropout_p=0., softmax_scale=None, causal=False, window_size=(-1, -1),
+            deterministic=False).unflatten(0, (b, lq))
+    return x.type(out_dtype)
 # ==== ours end ====
 
 
@@ -262,7 +423,7 @@ class CausalWanSelfAttention(nn.Module):
         """
         # ======== ours ========
         if persistent is not None:
-            return self.forward_persistent(x, grid_sizes, freqs, **persistent)
+            return self.forward_persistent(x, **persistent)
         # ==== ours end ====
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -529,31 +690,45 @@ class CausalWanSelfAttention(nn.Module):
 
 
     # ======== ours ========
-    def forward_persistent(self, x, grid_sizes, freqs, history_k, history_v,
-                           current_start_frame, write_page=False):
+    def forward_persistent(self, x, rope, history, write_page=False, kv_only=False):
         """Attention over immutable history pages plus this frame's own K/V.
 
-        history_k / history_v are tuples of pages (one per earlier frame). They
-        are concatenated here rather than by the caller, so a checkpointed frame
-        saves page references instead of a copy of the whole history.
-        Returns y, plus this frame's (k, v) when write_page is set. Pages hold
-        post-RoPE K, so a page is interchangeable with a KV-cache slot.
+        history is the layer's PageRead. With gradient, the history slots and
+        this frame's K/V are concatenated here rather than by the caller, so a
+        checkpointed frame saves references instead of a copy of the whole
+        history. Without gradient nothing is concatenated while the table has a
+        free slot: this frame's K/V go into it and the attention runs on a view
+        of the table (see PersistentKVStore).
+        Returns y, plus this frame's (k, v) when write_page is set; with kv_only
+        just (k, v), skipping the attention. Pages hold post-RoPE K, so a page
+        is interchangeable with a KV-cache slot. `rope` is the frame's
+        _rope_table.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        if not kv_only:
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
         kk, vv = self.k(x), self.v(x)
         if self.memory_lora and write_page:      # the page write IS the memory write
             kk, vv = kk + self.k_memory_lora(x), vv + self.v_memory_lora(x)
         k = self.norm_k(kk).view(b, s, n, d)
         v = vv.view(b, s, n, d)
-        q_rope = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-        k_rope = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-        if len(history_k):
-            k_attn = _PageCat.apply(*history_k, k_rope)
-            v_attn = _PageCat.apply(*history_v, v)
+        if not kv_only:
+            q_rope = _rope_apply(q, rope).type_as(v)
+        k_rope = _rope_apply(k, rope).type_as(v)
+        table, length = history.table, history.length
+        if not torch.is_grad_enabled() and length < table.max_frames:     # the history is read in place
+            k_rope, v = table.put(length, k_rope, v)
+            if kv_only:
+                return k_rope, v
+            k_attn, v_attn = table.k[:, :(length + 1) * s], table.v[:, :(length + 1) * s]
+        elif kv_only:
+            return k_rope, v
+        elif length:
+            k_attn = _PageCat.apply(table.k[:, :length * s], k_rope, *history.k_handles)
+            v_attn = _PageCat.apply(table.v[:, :length * s], v, *history.v_handles)
         else:
             k_attn, v_attn = k_rope, v
-        y = self.o(attention(q_rope, k_attn, v_attn).flatten(2))
+        y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
         if write_page:
             return y, k_rope, v
         return y
@@ -637,7 +812,7 @@ class CausalWanAttentionBlock(nn.Module):
         """
         # ======== ours ========
         if persistent is not None:
-            return self.forward_persistent(x, e, grid_sizes, freqs, context, context_lens, **persistent)
+            return self.forward_persistent(x, e, context, **persistent)
         # ==== ours end ====
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         # assert e.dtype == torch.float32
@@ -676,28 +851,53 @@ class CausalWanAttentionBlock(nn.Module):
 
 
     # ======== ours ========
-    def forward_persistent(self, x, e, grid_sizes, freqs, context, context_lens,
-                           history_k, history_v, current_start_frame, write_page=False):
+    def forward_persistent(self, x, e, context, rope, history, write_page=False, kv_only=False):
         """forward() against immutable pages instead of a KV cache, otherwise
-        identical. Cross-attention is recomputed rather than cached so the block
-        holds no mutable state that a checkpoint recomputation could not replay.
+        identical. A forward with gradient recomputes cross-attention rather
+        than caching it, so the block holds no mutable state that a checkpoint
+        recomputation could not replay. With kv_only (the writer's last block,
+        whose output nothing reads) only this frame's page is computed and x is
+        returned unchanged.
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
         out = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
-            None, grid_sizes, freqs, None,
-            persistent=dict(history_k=history_k, history_v=history_v,
-                            current_start_frame=current_start_frame, write_page=write_page))
+            None, None, None, None,
+            persistent=dict(rope=rope, history=history, write_page=write_page, kv_only=kv_only))
+        if kv_only:
+            return (x, *out)
         y, new_k, new_v = out if write_page else (out, None, None)
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
-        x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        x = x + self._cross_attn_persistent(self.norm3(x), context, history)
         y = self.ffn(
             (self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2))
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[5]).flatten(1, 2)
         if write_page:
             return x, new_k, new_v
         return x
+
+    def _cross_attn_persistent(self, x, context, history):
+        """self.cross_attn(x, context, None), op for op, with the flash-attn call
+        going through _flash_attention. A forward without gradient takes the
+        prompt's K/V from the layer's page table, where the rollout's first such
+        forward leaves them: they are the same for every frame and denoising
+        step, as in the inference path's crossattn_cache."""
+        ca = self.cross_attn
+        if not isinstance(ca, WanT2VCrossAttention):
+            return ca(x, context, None)
+        b, n, d = x.size(0), ca.num_heads, ca.head_dim
+        q = ca.norm_q(ca.q(x)).view(b, -1, n, d)
+        table = None if torch.is_grad_enabled() else history.table
+        if table is not None and table.context_kv is not None:
+            k, v = table.context_kv
+        else:
+            k = ca.norm_k(ca.k(context)).view(b, -1, n, d)
+            v = ca.v(context).view(b, -1, n, d)
+            if table is not None:      # kept, like the pages, in the dtype flash-attn computes in
+                k, v = k.to(_attn_dtype(k.dtype)), v.to(_attn_dtype(v.dtype))
+                table.context_kv = (k, v)
+        return ca.o(_flash_attention(q, k, v).flatten(2))
     # ==== ours end ====
 
 
@@ -1464,16 +1664,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]))
         return x, grid_sizes, e, e0, ctx
 
-    def _run_blocks(self, first, last, x, e0, grid_sizes, ctx, histories, frame_idx, write_page):
-        """Blocks first..last-1 of one persistent forward. Returns x, then the
-        pages of those blocks (k, v per block) when write_page is set."""
+    def _run_blocks(self, first, last, x, e0, ctx, rope, histories, write_page):
+        """Blocks first..last-1 of one persistent forward, `histories` being
+        those blocks' histories. Returns x, then the pages of those blocks
+        (k, v per block) when write_page is set. The writer's last block only
+        computes its page: nothing reads the writer's output."""
         pages = []
-        for layer_idx in range(first, last):
-            hk, hv = histories[layer_idx]
-            out = self.blocks[layer_idx](x, e0, None, grid_sizes, self.freqs, ctx, None, None,
-                                         persistent=dict(history_k=hk, history_v=hv,
-                                                         current_start_frame=frame_idx,
-                                                         write_page=write_page))
+        for layer_idx, history in zip(range(first, last), histories):
+            kv_only = write_page and layer_idx == len(self.blocks) - 1
+            out = self.blocks[layer_idx](x, e0, None, None, None, ctx, None, None,
+                                         persistent=dict(rope=rope, history=history,
+                                                         write_page=write_page, kv_only=kv_only))
             if write_page:
                 x, new_k, new_v = out
                 pages.extend([new_k, new_v])
@@ -1487,13 +1688,25 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         (the composition PyTorch supports, as _forward_train does). Only the
         group boundaries are kept between forward and backward: 1 keeps every
         block output, a larger group keeps fewer outputs and recomputes more
-        blocks per group. Pages are group outputs, so they are always kept."""
+        blocks per group. Pages are group outputs, so they are always kept.
+
+        A region is handed the histories of its own blocks only, and does not
+        preserve the RNG state. checkpoint() walks every tensor in its
+        arguments and, to preserve the RNG state, reads the CUDA generator
+        state once per tensor at forward time and reads or sets it three more
+        times per tensor at recomputation; the page handles of all 30 layers
+        are up to 1200 tensors, for every region. Nothing in a block draws
+        random numbers (no dropout; flash-attn with dropout_p=0 takes no
+        generator state), so there is no state to preserve."""
         n, g = len(self.blocks), max(1, int(self.persistent_checkpoint_group))
         ckpt = self.persistent_block_checkpointing and torch.is_grad_enabled()
+        rope = _rope_table(self.freqs, grid_sizes, frame_idx)
         pages = []
         for first in range(0, n, g):
-            args = (first, min(first + g, n), x, e0, grid_sizes, ctx, histories, frame_idx, write_page)
-            out = (torch.utils.checkpoint.checkpoint(self._run_blocks, *args, use_reentrant=False)
+            last = min(first + g, n)
+            args = (first, last, x, e0, ctx, rope, histories[first:last], write_page)
+            out = (torch.utils.checkpoint.checkpoint(self._run_blocks, *args, use_reentrant=False,
+                                                     preserve_rng_state=False)
                    if ckpt else self._run_blocks(*args))
             x, pages = out[0], pages + list(out[1:])
         return x, pages
