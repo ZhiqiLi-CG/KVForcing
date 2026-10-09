@@ -115,6 +115,38 @@ VAE does not run out of memory. `scripts/eval/sample_for_vbench.sh` and
 `scripts/eval/eval_vbench.sh` sample and score with the official VBench /
 VBench-Long evaluators (cloned separately, see the scripts).
 
+### Evaluating the model the way it was trained
+
+Training attends to the whole 21-frame clip (`local_attn_size 18` + `sink_size 3`).
+Three things keep sampled videos consistent with that:
+
+* **Inference mode.** `scripts/infer.sh` and every suite of
+  `scripts/eval/sample_for_vbench.sh` pass `--long_video` with a 21-frame window
+  (sink 4 + FIFO 16 + current 1); for a 21-frame clip that is exactly the
+  training rollout. Calling `inference.py` without `--long_video` is equivalent
+  up to 21 frames. (Until 2026-10-09 it was not: the plain mode sized its KV
+  cache to `local_attn_size` alone, 18 frames including the 3 sink frames, so
+  latent frames 19-21 of every 5 s clip lost 1-3 frames of history. The cache
+  now holds sink + window.)
+* **Prompts.** The model has only seen long, LLM-extended prompts. Short
+  benchmark prompts must be extended: `inference.py --extended_prompt_path`
+  generates from the extended prompt and names the file after the short one.
+  `prompts/vbench/` has the VBench prompts in both forms.
+* **A test.** `scripts/eval/check_train_eval_consistency.py` rolls the same
+  noise through the inference pipeline (both modes) and through the training
+  rollout and compares frame by frame in exact arithmetic. Run it after any
+  change to the attention, the KV cache or the pipelines:
+
+  ```bash
+  python scripts/eval/check_train_eval_consistency.py --config_path CFG --checkpoint_path CKPT \
+      --mode fp64 --device cpu --hw 12x20        # minutes on a CPU node; drop --device/--hw on a GPU
+  ```
+
+Two differences between training and inference are inherited from Self-Forcing
+and left as they are: training adds a little noise (sigma about 0.005) to a
+frame before writing it to memory, and FSDP mixed precision rounds the float
+timestep to bf16 in training (937.5 becomes 936).
+
 ## Acknowledgements
 
 This code builds on [Causal-Forcing](https://github.com/thu-ml/Causal-Forcing),
