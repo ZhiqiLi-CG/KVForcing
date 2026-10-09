@@ -73,17 +73,22 @@ class Trainer:
         # ======== ours ========
         # The frozen teacher (real_score) may run in bf16 while everything that is
         # trained stays fp32: it has no gradients, so no accumulation precision is
-        # at stake, and it is by far the largest model. Its inputs are cast on entry.
+        # at stake, and it is by far the largest model. It casts its own latents
+        # and text embeddings (WanDiffusionWrapper.input_dtype) and keeps the
+        # timestep in fp32: FSDP's input cast would round the timestep to bf16
+        # (795.78 -> 796) for the teacher only, so the DMD gradient would compare
+        # the critic and the teacher at two different timesteps.
         teacher_bf16 = bool(getattr(config, "real_score_bf16", False)) and not config.mixed_precision
         if teacher_bf16:
             self.model.real_score.to(torch.bfloat16)
+            self.model.real_score.input_dtype = torch.bfloat16
         # ==== ours end ====
         self.model.real_score = fsdp_wrap(
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             # ======== ours ========
             mixed_precision=config.mixed_precision or teacher_bf16,
-            cast_forward_inputs=teacher_bf16,
+            cast_root_forward_inputs=not teacher_bf16,
             # ==== ours end ====
             wrap_strategy=config.real_score_fsdp_wrap_strategy,
             cpu_offload=False

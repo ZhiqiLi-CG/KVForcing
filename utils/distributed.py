@@ -22,7 +22,7 @@ def fsdp_state_dict(model):
 
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False,
               # ======== ours ========
-              cast_forward_inputs=False
+              cast_root_forward_inputs=True
               # ==== ours end ====
               ):
     if mixed_precision:
@@ -31,7 +31,10 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
             reduce_dtype=torch.float32,
             buffer_dtype=torch.float32,
             # ======== ours ========
-            cast_forward_inputs=cast_forward_inputs
+            # FSDP's root input cast (on by default, as upstream trains) converts
+            # EVERY floating forward input to bf16, the timestep included. A
+            # module that casts its own inputs turns it off (see trainer).
+            cast_root_forward_inputs=cast_root_forward_inputs
             # ==== ours end ====
         )
     else:

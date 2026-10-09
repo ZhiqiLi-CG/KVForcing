@@ -251,6 +251,16 @@ class WanDiffusionWrapper(torch.nn.Module):
         memory_lora_write: bool = False
         # ==== ours end ====
     ) -> torch.Tensor:
+        # ======== ours ========
+        # A wrapper that runs in another dtype than its caller (the bf16 teacher
+        # of fp32 training) casts its own latents and text embeddings; the
+        # timestep is left as it is.
+        input_dtype = getattr(self, "input_dtype", None)
+        if input_dtype is not None:
+            noisy_image_or_video = noisy_image_or_video.to(input_dtype)
+            conditional_dict = {k: (v.to(input_dtype) if torch.is_tensor(v) and v.is_floating_point() else v)
+                                for k, v in conditional_dict.items()}
+        # ==== ours end ====
         prompt_embeds = conditional_dict["prompt_embeds"]
 
         # [B, F] -> [B]
