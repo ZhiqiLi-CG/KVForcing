@@ -34,6 +34,23 @@ flex_attention = torch.compile(
 
 
 
+# ======== memlora_alpha probe (slurm-2, 2026-10-09; inference only, --long_video path only) ========
+# MEMLORA_ALPHA unset: original code. Otherwise the long-video cache also keeps the pre-norm parts of every page,
+#   kA = W_k x, kB = dW_k x (Memory-LoRA), vA = W_v x, vB = dW_v x   (kB = vB = 0 where no memory write happened)
+# and K/V of a cached frame at distance d from the current frame are rebuilt at read time as
+#   K = norm_k(kA + alpha(d) kB),  V = vA + alpha(d) vB      (the original page is the case alpha = 1)
+#   check  : assert the rebuilt alpha=1 K/V equal the stored ones bit for bit, attend with the stored ones (bookkeeping test)
+#   const1 : attend with the rebuilt K/V, alpha = 1 everywhere (must reproduce the original exactly)
+#   linear : alpha(d) = min(d, D) / D, D = MEMLORA_ALPHA_D (default 20 = farthest distance of the 21-frame training
+#            window); d = current frame index - cached frame index (absolute frames), so the current frame gets 0 and
+#            everything at distance >= D (the sink frames of a long video) gets 1.
+import os as _os
+MEMLORA_ALPHA = _os.environ.get("MEMLORA_ALPHA", "")
+MEMLORA_ALPHA_D = int(_os.environ.get("MEMLORA_ALPHA_D", "20"))
+assert MEMLORA_ALPHA in ("", "check", "const1", "linear"), MEMLORA_ALPHA
+# ==== memlora_alpha end ====
+
+
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     n, c = x.size(2), x.size(3) // 2
 
@@ -560,6 +577,10 @@ class CausalWanSelfAttention(nn.Module):
             # ======== ours ========
             # (replaces upstream's `k = norm_k(k(x))`, `v = v(x)`; identical when dk is None)
             kk, vv = self.k(x), self.v(x)
+            if MEMLORA_ALPHA:                                     # memlora_alpha probe: pre-norm parts of this block
+                parts["kA"], parts["vA"] = kk.view(b, s, n, d), vv.view(b, s, n, d)
+                parts["kB"] = dk.view(b, s, n, d) if dk is not None else torch.zeros_like(parts["kA"])
+                parts["vB"] = dv.view(b, s, n, d) if dv is not None else torch.zeros_like(parts["vA"])
             if dk is not None:
                 kk, vv = kk + dk, vv + dv
             k = self.norm_k(kk).view(b, s, n, d)
@@ -567,6 +588,7 @@ class CausalWanSelfAttention(nn.Module):
             # ==== ours end ====
             return q, k, v
 
+        parts = {}
         q, k, v = qkv_fn(x)
 
         if kv_cache is None:
@@ -682,6 +704,9 @@ class CausalWanSelfAttention(nn.Module):
                     if src_hi > src_lo:
                         kv_cache["k"][:, dst_lo:dst_hi] = kv_cache["k"][:, src_lo:src_hi].clone()
                         kv_cache["v"][:, dst_lo:dst_hi] = kv_cache["v"][:, src_lo:src_hi].clone()
+                        if MEMLORA_ALPHA:                         # memlora_alpha probe: same shift for the parts
+                            for _key in ("kA", "kB", "vA", "vB"):
+                                kv_cache[_key][:, dst_lo:dst_hi] = kv_cache[_key][:, src_lo:src_hi].clone()
                     del abs_list[sink:sink + num_evict]
                 abs_list.extend(new_block_abs)
                 tail_slot = len(abs_list) - cur_frames
@@ -691,6 +716,11 @@ class CausalWanSelfAttention(nn.Module):
             tail_hi = tail_lo + cur_frames * fs
             kv_cache["k"][:, tail_lo:tail_hi] = k
             kv_cache["v"][:, tail_lo:tail_hi] = v
+            if MEMLORA_ALPHA:                                     # memlora_alpha probe: store the pre-norm parts
+                for _key in ("kA", "kB", "vA", "vB"):
+                    if _key not in kv_cache:
+                        kv_cache[_key] = torch.zeros_like(kv_cache["k"])
+                    kv_cache[_key][:, tail_lo:tail_hi] = parts[_key]
 
             num_occ = len(abs_list)
             if self.kv_cache_position_mode == "contiguous":
@@ -720,8 +750,28 @@ class CausalWanSelfAttention(nn.Module):
 
             window_grid = grid_sizes.clone()
             window_grid[:, 0] = num_occ
+            key_src, val_src = kv_cache["k"][:, :num_occ * fs], kv_cache["v"][:, :num_occ * fs]
+            if MEMLORA_ALPHA:                                     # memlora_alpha probe: rebuild K/V per cached frame
+                L = num_occ * fs
+                kA, kB = kv_cache["kA"][:, :L], kv_cache["kB"][:, :L]
+                vA, vB = kv_cache["vA"][:, :L], kv_cache["vB"][:, :L]
+                if MEMLORA_ALPHA == "linear":
+                    q_abs_now = cur_abs + cur_frames - 1
+                    dist = torch.tensor([max(0, min(q_abs_now - a, MEMLORA_ALPHA_D)) for a in abs_list],
+                                        device=q.device, dtype=torch.float32)
+                    alpha = (dist / MEMLORA_ALPHA_D).repeat_interleave(fs).view(1, L, 1, 1)
+                else:
+                    alpha = torch.ones(1, L, 1, 1, device=q.device, dtype=torch.float32)
+                # combine in at least fp32 (exact for bf16 parts, keeps fp64 parts fp64)
+                hp = torch.promote_types(kB.dtype, torch.float32)
+                k_re = self.norm_k((kA + (kB.to(hp) * alpha.to(hp)).to(kA.dtype)).reshape(b, L, n * d)).view(b, L, n, d)
+                v_re = vA + (vB.to(hp) * alpha.to(hp)).to(vA.dtype)
+                if MEMLORA_ALPHA == "check":
+                    assert torch.equal(k_re, key_src) and torch.equal(v_re, val_src), "memlora_alpha: rebuilt K/V differ"
+                else:
+                    key_src, val_src = k_re, v_re
             roped_key = causal_rope_apply_frames(
-                kv_cache["k"][:, :num_occ * fs], window_grid, freqs, pos).type_as(v)
+                key_src, window_grid, freqs, pos).type_as(v)
 
             q_pos = pos[tail_slot:tail_slot + cur_frames]
             roped_query = causal_rope_apply_frames(
@@ -730,7 +780,7 @@ class CausalWanSelfAttention(nn.Module):
             x = attention(
                 roped_query,
                 roped_key,
-                kv_cache["v"][:, :num_occ * fs]
+                val_src
             )
             # Keep the legacy counters roughly in sync (unused by this path).
             kv_cache["global_end_index"].fill_(current_start + q.shape[1])
