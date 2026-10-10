@@ -403,12 +403,15 @@ class Trainer:
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
+            # Re-DMD needs the prompt strings for the reward model; without reward_dmd the call is unchanged
+            reward_kwargs = {"text_prompts": text_prompts} if getattr(self.config, "reward_dmd", False) else {}
             generator_loss, generator_log_dict = self.model.generator_loss(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 clean_latent=clean_latent,
-                initial_latent=image_latent if self.config.i2v else None
+                initial_latent=image_latent if self.config.i2v else None,
+                **reward_kwargs
             )
            
             generator_loss.backward()

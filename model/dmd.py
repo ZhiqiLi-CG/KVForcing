@@ -50,7 +50,13 @@ class DMD(SelfForcingModel):
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
         else:
             self.scheduler.alphas_cumprod = None
-        
+
+        # Re-DMD (Reward Forcing, arXiv 2512.04678): reward-weighted DMD loss of the generator. Off by default; when off,
+        # nothing below runs and the losses are computed exactly as before. The scorer is loaded on first use.
+        self.reward_dmd = bool(getattr(args, "reward_dmd", False))
+        self.reward_dmd_beta = float(getattr(args, "reward_dmd_beta", 2.0))   # Reward Forcing configs/reward_forcing.yaml
+        self._reward_scorer_obj = None
+
 
 
     def _compute_kl_grad(
@@ -134,10 +140,12 @@ class DMD(SelfForcingModel):
         unconditional_dict: dict,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
-        denoised_timestep_to: int = 0
+        denoised_timestep_to: int = 0,
+        sample_weight: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
+        sample_weight (Re-DMD only): [B] weights; the loss becomes 0.5 * mean_b(w_b * mse_b). None = the original loss.
         Input:
             - image_or_video: a tensor with shape [B, F, C, H, W] where the number of frame is 1 for images.
             - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
@@ -187,7 +195,17 @@ class DMD(SelfForcingModel):
                 unconditional_dict=unconditional_dict
             )
 
-        if gradient_mask is not None:
+        if sample_weight is not None:
+            # Re-DMD: per-sample MSE, each weighted by its own reward weight (with batch 1 this is exactly Reward Forcing's
+            # 0.5 * exp(beta * r) * mse_loss(...), model/re_dmd.py:190-194)
+            sq = (original_latent.double() - (original_latent.double() - grad.double()).detach()) ** 2
+            if gradient_mask is not None:
+                m = gradient_mask.to(sq.dtype)
+                per_sample = (sq * m).flatten(1).sum(1) / m.flatten(1).sum(1)
+            else:
+                per_sample = sq.flatten(1).mean(1)
+            dmd_loss = 0.5 * (sample_weight.to(device=per_sample.device, dtype=per_sample.dtype) * per_sample).mean()
+        elif gradient_mask is not None:
             # Useless if we set always 21 latent frames
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
             )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
@@ -196,16 +214,45 @@ class DMD(SelfForcingModel):
             ), (original_latent.double() - grad.double()).detach(), reduction="mean")
         return dmd_loss, dmd_log_dict
 
+    def _reward_scorer(self):
+        if self._reward_scorer_obj is None:
+            from model.reward_scorer import RewardScorer
+            self._reward_scorer_obj = RewardScorer(
+                reward_path=self.args.reward_model_path,
+                base_path=self.args.reward_model_base_path,
+                device=self.device,
+                preprocess=getattr(self.args, "reward_dmd_preprocess", "fixed"),
+                key=getattr(self.args, "reward_dmd_key", "MQ"))
+        return self._reward_scorer_obj
+
+    def reward_weights(self, pred_image: torch.Tensor, text_prompts: list) -> Tuple[torch.Tensor, dict]:
+        """Re-DMD weights exp(beta * r) of the generated clips (no gradient: decoded and scored under no_grad)."""
+        first_only = bool(getattr(self.args, "reward_dmd_first_sample", False))   # Reward Forcing: [videos[0]] only
+        with torch.no_grad():
+            lat = pred_image.detach()[:1] if first_only else pred_image.detach()
+            pixels = self.vae.decode_to_pixel(lat)                          # [B, 4F-3, 3, H, W] in [-1, 1]
+            rewards = self._reward_scorer().score(pixels, text_prompts[:1] if first_only else text_prompts)
+            del pixels
+            r = rewards[self._reward_scorer().key].to(torch.float64)
+            w = torch.exp(self.reward_dmd_beta * r)
+            if first_only:                       # one weight for the whole local batch, as re_dmd.py:190-194
+                w = w.expand(pred_image.shape[0]).clone()
+        log = {"reward_" + k: v.detach() for k, v in rewards.items()}
+        log["reward_weight"] = w.detach()
+        return w, log
+
     def generator_loss(
         self,
         image_or_video_shape,
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        text_prompts: Optional[list] = None
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
+        text_prompts: the prompt strings; needed (and passed by the trainer) only when reward_dmd is on.
         The noisy input to the generator is backward simulated.
         This removes the need of any datasets during distillation.
         See Sec 4.5 of the DMD2 paper (https://arxiv.org/abs/2405.14867) for details.
@@ -225,15 +272,37 @@ class DMD(SelfForcingModel):
             initial_latent=initial_latent
         )
 
-        # Step 2: Compute the DMD loss
+        if not self.reward_dmd:
+            # Step 2: Compute the DMD loss
+            dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
+                image_or_video=pred_image,
+                conditional_dict=conditional_dict,
+                unconditional_dict=unconditional_dict,
+                gradient_mask=gradient_mask,
+                denoised_timestep_from=denoised_timestep_from,
+                denoised_timestep_to=denoised_timestep_to
+            )
+
+            return dmd_loss, dmd_log_dict
+
+        # Re-DMD: score the generated clips (frozen reward model, no gradient) and weight each sample's DMD loss
+        assert text_prompts is not None and len(text_prompts) == pred_image.shape[0], "reward_dmd needs the prompt strings"
+        sample_weight, reward_log = self.reward_weights(pred_image, text_prompts)
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
             image_or_video=pred_image,
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             gradient_mask=gradient_mask,
             denoised_timestep_from=denoised_timestep_from,
-            denoised_timestep_to=denoised_timestep_to
+            denoised_timestep_to=denoised_timestep_to,
+            sample_weight=sample_weight
         )
+        dmd_log_dict.update(reward_log)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print("[reward] rank %d %s: %s | weight %s" % (
+            rank, self._reward_scorer().key,
+            " ".join("%.3f" % x for x in reward_log["reward_" + self._reward_scorer().key].tolist()),
+            " ".join("%.3f" % x for x in sample_weight.tolist())), flush=True)
 
         return dmd_loss, dmd_log_dict
 
