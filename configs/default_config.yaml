@@ -31,6 +31,13 @@ kv_forcing_fuse_grad_forwards: false
 kv_forcing_page_mode: kv
 # with mixed_precision false, still run the frozen teacher (real_score) in bf16
 real_score_bf16: false
+# Memory-LoRA (model_kwargs.memory_lora: true): what the memory write runs.
+#   coupled    the write forward uses (W + dW) for its own K/V and reads the LoRA pages; its pages carry the LoRA
+#   decoupled  the write forward is the base network (own K/V W h, reads base pages of the earlier writes) and
+#              writes, from the same h, a base page (read by later writes) and a LoRA page (W + dW) h (read by the
+#              generation forwards). Training: grad_mode kv_forcing (page_mode kv: two page sets; h: one h page per
+#              layer serves both); inference keeps two KV caches (pipeline/causal_inference.py).
+memory_lora_write: coupled
 # ==== ours end ====
 causal: true
 

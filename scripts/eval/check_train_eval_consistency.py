@@ -103,7 +103,8 @@ device = torch.device(args.device)
 config = OmegaConf.merge(OmegaConf.load("configs/default_config.yaml"), OmegaConf.load(CFG))
 R = dict(config=CFG, checkpoint=CK, code=ROOT, mode=args.mode, device=args.device, hw=args.hw or None,
          frames=args.frames or None, host=os.uname().nodename, torch=torch.__version__,
-         grad_mode=str(config.grad_mode), model_kwargs=OmegaConf.to_container(config.model_kwargs), checks={}, compare={})
+         grad_mode=str(config.grad_mode), model_kwargs=OmegaConf.to_container(config.model_kwargs),
+         memory_lora_write=str(config.get("memory_lora_write", "coupled")), checks={}, compare={})
 fails, notes = [], []
 
 
@@ -371,7 +372,8 @@ def compare(label, x, y):
     return c
 
 
-say("=== grad_mode %s | mode %s | %d frames | %s ===" % (config.grad_mode, args.mode, F_, args.device))
+say("=== grad_mode %s | memory_lora_write %s | mode %s | %d frames | %s ===" % (
+    config.grad_mode, R["memory_lora_write"], args.mode, F_, args.device))
 A, tA, fA = run_inference(False)
 B, tB, fB = run_inference(True)
 R["cache_frames"], R["seconds"] = dict(plain=fA, long_video=fB), dict(A=tA, B=tB)

@@ -197,6 +197,20 @@ class HPageRead(NamedTuple):
     pages: tuple
 
 
+class DecoupledRead(NamedTuple):
+    """One layer's histories for the memory write under memory_lora_write
+    "decoupled" (the write forward alone, or the fused [noisy; write] pair).
+    The write forward runs the BASE network: its own K/V are W h and it reads
+    the base pages (`base`, K = RoPE(norm_k(W_k h)), V = W_v h of the earlier
+    writers). From the same h it also produces the LoRA page
+    (K = RoPE(norm_k((W_k + dW_k) h)), V = (W_v + dW_v) h), which only the
+    generation forwards read (`lora`, the store they are handed). Both are
+    PageReads of equal length; a forward without gradient puts the LoRA page
+    straight into `lora`'s table slot, as it puts its base K/V into `base`'s."""
+    lora: PageRead
+    base: PageRead
+
+
 class PersistentKVStore:
     """Immutable K/V pages written by the KV Forcing rollout.
 
@@ -349,6 +363,42 @@ class _PageCatPair(torch.autograd.Function):
         return (None, owned(grad[:b, ctx.split:]), owned(grad[b:, ctx.split:]), *page_grads)
 
 
+class _PageCatPairSplit(torch.autograd.Function):
+    """_PageCatPair for memory_lora_write "decoupled": the two halves read
+    DIFFERENT histories of the same length, the noisy half `history_noisy` (the
+    LoRA pages), the write half `history_write` (the base pages). Returns
+    [history_noisy | own_noisy] stacked on [history_write | own_write]. The
+    backward hands the first `n_noisy` handles their slice of the noisy half's
+    gradient and the remaining handles theirs of the write half's, each a fresh
+    contiguous tensor cast back (see _PageCat); no page receives a gradient
+    from the half that does not read it."""
+
+    @staticmethod
+    def forward(ctx, history_noisy, history_write, own_noisy, own_write, n_noisy, *handles):
+        ctx.sizes_noisy = [h.shape[1] for h in handles[:n_noisy]]
+        ctx.sizes_write = [h.shape[1] for h in handles[n_noisy:]]
+        ctx.split = history_noisy.shape[1]
+        ctx.dtype = own_noisy.dtype
+        b = own_noisy.shape[0]
+        out = history_noisy.new_empty((2 * b, ctx.split + own_noisy.shape[1], *history_noisy.shape[2:]))
+        out[:b, :ctx.split] = history_noisy
+        out[b:, :ctx.split] = history_write
+        out[:b, ctx.split:] = own_noisy
+        out[b:, ctx.split:] = own_write
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        b = grad.shape[0] // 2
+
+        def owned(g):
+            return g.to(ctx.dtype, copy=True, memory_format=torch.contiguous_format)
+        noisy = grad[:b, :ctx.split].split(ctx.sizes_noisy, dim=1) if ctx.sizes_noisy else ()
+        write = grad[b:, :ctx.split].split(ctx.sizes_write, dim=1) if ctx.sizes_write else ()
+        return (None, None, owned(grad[:b, ctx.split:]), owned(grad[b:, ctx.split:]), None,
+                *(owned(g) for g in noisy), *(owned(g) for g in write))
+
+
 class _HPageCat(torch.autograd.Function):
     """torch.cat over the h pages of a layer whose backward hands each page a
     CONTIGUOUS gradient instead of a view into the whole history's (see
@@ -364,22 +414,43 @@ class _HPageCat(torch.autograd.Function):
         return tuple(g.clone(memory_format=torch.contiguous_format) for g in grad.split(ctx.sizes, dim=1))
 
 
-def _rebuild_history_kv(attn, pages, rope_hist):
+def _rebuild_history_kv(attn, pages, rope_hist, memory_lora=True):
     """The history K/V of one layer from its h pages, with the ops the writers
     ran on the same h, in the same order: K = RoPE(norm_k(W_k h + dW_k h)),
     V = W_v h + dW_v h (a page is a memory write, so the Memory-LoRA applies to
     every page). One GEMM over the concatenated history instead of one per
     page, and RoPE over frames 0..m-1 at once (`rope_hist`); every output row
-    depends on its own input row only."""
+    depends on its own input row only. memory_lora=False rebuilds the BASE
+    pages of memory_lora_write "decoupled" (W h, no dW)."""
     b, s = pages[0].shape[:2]
     m, n, d = len(pages), attn.num_heads, attn.head_dim
     hh = _HPageCat.apply(*pages)
     kk, vv = attn.k(hh), attn.v(hh)
-    if attn.memory_lora:
+    if attn.memory_lora and memory_lora:
         kk, vv = kk + attn.k_memory_lora(hh), vv + attn.v_memory_lora(hh)
     k = attn.norm_k(kk).view(b, m * s, n, d)
     v = vv.view(b, m * s, n, d)
     return _rope_apply(k, rope_hist).type_as(v), v
+
+
+def _rebuild_history_kv_decoupled(attn, pages, rope_hist):
+    """memory_lora_write "decoupled" under page_mode "h": both histories of
+    one layer from its h pages, with the writers' ops (see
+    _rebuild_history_kv): the LoRA K/V the generation forwards read,
+    K = RoPE(norm_k(W_k h + dW_k h)), V = W_v h + dW_v h, and the base K/V the
+    write forwards read, K = RoPE(norm_k(W_k h)), V = W_v h. One GEMM per
+    projection over the concatenated history for both. Returns
+    (k_lora, v_lora, k_base, v_base)."""
+    b, s = pages[0].shape[:2]
+    m, n, d = len(pages), attn.num_heads, attn.head_dim
+    hh = _HPageCat.apply(*pages)
+    kk, vv = attn.k(hh), attn.v(hh)
+    k_base = attn.norm_k(kk).view(b, m * s, n, d)
+    v_base = vv.view(b, m * s, n, d)
+    k_lora = attn.norm_k(kk + attn.k_memory_lora(hh)).view(b, m * s, n, d)
+    v_lora = (vv + attn.v_memory_lora(hh)).view(b, m * s, n, d)
+    return (_rope_apply(k_lora, rope_hist).type_as(v_lora), v_lora,
+            _rope_apply(k_base, rope_hist).type_as(v_base), v_base)
 
 
 def _rope_table(freqs, grid_sizes, start_frame, frames=1):
@@ -520,7 +591,9 @@ class CausalWanSelfAttention(nn.Module):
         cache_start=None,
         # ======== ours ========
         persistent=None,
-        memory_write=False
+        memory_write=False,
+        memory_base_cache=None,
+        _write_only=False
         # ==== ours end ====
     ):
         r"""
@@ -534,6 +607,17 @@ class CausalWanSelfAttention(nn.Module):
         # ======== ours ========
         if persistent is not None:
             return self.forward_persistent(x, **persistent)
+        if memory_base_cache is not None:
+            # memory_lora_write "decoupled": the memory write is the BASE network, run against the base cache
+            # (memory_base_cache, which only memory writes read and write), and it puts the LoRA K/V (W + dW) h
+            # of the same h into kv_cache, the cache the generation forwards read, at the same slot by the same
+            # cache logic (the _write_only pass skips the query and the attention).
+            if not (self.memory_lora and memory_write):
+                raise ValueError("memory_base_cache is for a Memory-LoRA memory write (memory_write=True) only.")
+            self.forward(x, seq_lens, grid_sizes, freqs, block_mask, kv_cache, current_start, cache_start,
+                         memory_write=True, _write_only=True)
+            return self.forward(x, seq_lens, grid_sizes, freqs, block_mask, memory_base_cache, current_start,
+                                cache_start)
         # ==== ours end ====
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -556,7 +640,9 @@ class CausalWanSelfAttention(nn.Module):
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            # ======== ours ======== (no query for a _write_only pass)
+            q = None if _write_only else self.norm_q(self.q(x)).view(b, s, n, d)
+            # ==== ours end ====
             # ======== ours ========
             # (replaces upstream's `k = norm_k(k(x))`, `v = v(x)`; identical when dk is None)
             kk, vv = self.k(x), self.v(x)
@@ -649,7 +735,7 @@ class CausalWanSelfAttention(nn.Module):
             # Store raw (pre-RoPE) K/V; re-apply RoPE with relative indices so
             # the temporal position always lives in [0, kv_cache_max_frames-1].
             fs = math.prod(grid_sizes[0][1:]).item()
-            cur_frames = q.shape[1] // fs
+            cur_frames = s // fs        # ours: s (= q.shape[1]), there is no q in a _write_only pass
             cur_abs = current_start // fs
             max_frames = self.kv_cache_max_frames
             sink = self.kv_cache_sink
@@ -691,6 +777,12 @@ class CausalWanSelfAttention(nn.Module):
             tail_hi = tail_lo + cur_frames * fs
             kv_cache["k"][:, tail_lo:tail_hi] = k
             kv_cache["v"][:, tail_lo:tail_hi] = v
+            # ======== ours ========
+            if _write_only:      # the counters as set below; no query, no attention
+                kv_cache["global_end_index"].fill_(current_start + s)
+                kv_cache["local_end_index"].fill_(len(abs_list) * fs)
+                return None
+            # ==== ours end ====
 
             num_occ = len(abs_list)
             if self.kv_cache_position_mode == "contiguous":
@@ -738,16 +830,17 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
-            roped_query = causal_rope_apply(
+            # ours: no query in a _write_only pass; s (= roped_query.shape[1]) below
+            roped_query = None if _write_only else causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
-            current_end = current_start + roped_query.shape[1]
+            current_end = current_start + s
             sink_tokens = self.sink_size * frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
+            num_new_tokens = s
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                 # Calculate the number of new tokens added in this step
@@ -771,6 +864,12 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+            # ======== ours ========
+            if _write_only:      # the counters as set below; no query, no attention
+                kv_cache["global_end_index"].fill_(current_end)
+                kv_cache["local_end_index"].fill_(local_end_index)
+                return None
+            # ==== ours end ====
             win_lo = max(0, local_end_index - self.max_attention_size)
             if self.local_attn_size != -1 and sink_tokens > 0 and win_lo > sink_tokens:
                 # Disjoint sink + recent window (a real gap separates them).
@@ -822,7 +921,11 @@ class CausalWanSelfAttention(nn.Module):
         layer's attention input, carrying the graph.
         A write_mask marks the fused [noisy; write] batch
         (forward_persistent_pair).
+        A DecoupledRead marks the memory write under memory_lora_write
+        "decoupled" (forward_persistent_decoupled).
         """
+        if isinstance(history, DecoupledRead):
+            return self.forward_persistent_decoupled(x, rope, history, write_page, kv_only, write_mask, rope_hist)
         if write_mask is not None:
             return self.forward_persistent_pair(x, rope, history, write_mask, rope_hist)
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -907,6 +1010,117 @@ class CausalWanSelfAttention(nn.Module):
                 k_attn, v_attn = torch.cat([k_noisy, k_write]), torch.cat([v_noisy, v_write])
         y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
         return (y, *page)
+
+    def forward_persistent_decoupled(self, x, rope, history, write_page=True, kv_only=False, write_mask=None,
+                                     rope_hist=None):
+        """The memory write under memory_lora_write "decoupled"; `history` is
+        the layer's DecoupledRead. The write forward is the BASE network: its
+        own K/V are W h and it attends to the base pages, so its hidden states
+        are those of the model without Memory-LoRA. From the same h it produces
+        two pages: the base page (k, v) = (RoPE(norm_k(W_k h)), W_v h), which
+        the later write forwards read, and the LoRA page
+        (RoPE(norm_k(W_k h + dW_k h)), W_v h + dW_v h), which the later
+        generation forwards read (the ops of the coupled write's page).
+        Returns y, k, v, k_lora, v_lora; with kv_only just the four pages.
+        Without gradient both pages go straight into their tables' slots, as
+        forward_persistent does with the one page. With write_mask, x is the
+        fused [noisy; write] batch (forward_persistent_pair_decoupled).
+
+        Under page_mode "h" a forward with gradient is handed HPageReads (the
+        same h pages in both fields): the base history is rebuilt from them
+        without dW, and the page it writes is
+        (k, v, k_lora, v_lora, h) with the K/V detached for the two tables and
+        h = x carrying the graph, ONE h page for both page sets."""
+        if not (self.memory_lora and write_page):
+            raise RuntimeError("a DecoupledRead is the history of a Memory-LoRA memory write only.")
+        if write_mask is not None:
+            return self.forward_persistent_pair_decoupled(x, rope, history, rope_hist)
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        if not kv_only:
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+        kk, vv = self.k(x), self.v(x)
+        k = self.norm_k(kk).view(b, s, n, d)
+        v = vv.view(b, s, n, d)
+        k_lora = self.norm_k(kk + self.k_memory_lora(x)).view(b, s, n, d)
+        v_lora = (vv + self.v_memory_lora(x)).view(b, s, n, d)
+        if not kv_only:
+            q_rope = _rope_apply(q, rope).type_as(v)
+        k_rope = _rope_apply(k, rope).type_as(v)
+        k_lora = _rope_apply(k_lora, rope).type_as(v_lora)
+        lora, base = history.lora, history.base
+        if isinstance(base, HPageRead):
+            if not torch.is_grad_enabled():      # the tables are what a forward without gradient reads
+                raise RuntimeError("h pages are for forwards with gradient.")
+            page = (k_rope.detach(), v.detach(), k_lora.detach(), v_lora.detach(), x)
+            if kv_only:
+                return page
+            if len(base.pages):
+                k_hist, v_hist = _rebuild_history_kv(self, base.pages, rope_hist, memory_lora=False)
+                k_attn, v_attn = torch.cat([k_hist, k_rope], dim=1), torch.cat([v_hist, v], dim=1)
+            else:
+                k_attn, v_attn = k_rope, v
+            return (self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2)), *page)
+        table, length = base.table, base.length
+        if not torch.is_grad_enabled() and length < table.max_frames:     # both histories are read in place
+            k_rope, v = table.put(length, k_rope, v)
+            k_lora, v_lora = lora.table.put(lora.length, k_lora, v_lora)
+            if kv_only:
+                return k_rope, v, k_lora, v_lora
+            k_attn, v_attn = table.k[:, :(length + 1) * s], table.v[:, :(length + 1) * s]
+        elif kv_only:
+            return k_rope, v, k_lora, v_lora
+        elif length:
+            k_attn = _PageCat.apply(table.k[:, :length * s], k_rope, *base.k_handles)
+            v_attn = _PageCat.apply(table.v[:, :length * s], v, *base.v_handles)
+        else:
+            k_attn, v_attn = k_rope, v
+        y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
+        return y, k_rope, v, k_lora, v_lora
+
+    def forward_persistent_pair_decoupled(self, x, rope, history, rope_hist=None):
+        """forward_persistent_pair under memory_lora_write "decoupled", with
+        gradient: both halves of [noisy; write] use W h for their own K/V; the
+        noisy half attends to the LoRA pages (history.lora), the write half to
+        the base pages (history.base). Returns y and the write half's two pages
+        (k, v, k_lora, v_lora), see forward_persistent_decoupled. The LoRA
+        projection runs on the write half only. Under page_mode "h" (HPageReads)
+        both histories are rebuilt from the one set of h pages
+        (_rebuild_history_kv_decoupled) and the page is
+        (k, v, k_lora, v_lora, h) with the K/V detached."""
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        h = b // 2
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        kk, vv = self.k(x), self.v(x)
+        k = self.norm_k(kk).view(b, s, n, d)
+        v = vv.view(b, s, n, d)
+        x_write = x[h:]
+        k_lora = self.norm_k(kk[h:] + self.k_memory_lora(x_write)).view(h, s, n, d)
+        v_lora = (vv[h:] + self.v_memory_lora(x_write)).view(h, s, n, d)
+        q_rope = _rope_apply(q, rope).type_as(v)
+        k_noisy = _rope_apply(k[:h], rope).type_as(v)
+        k_write = _rope_apply(k[h:], rope).type_as(v)
+        k_lora = _rope_apply(k_lora, rope).type_as(v_lora)
+        v_noisy, v_write = v[:h], v[h:].clone()
+        lora, base = history.lora, history.base
+        if isinstance(base, HPageRead):
+            page = (k_write.detach(), v_write.detach(), k_lora.detach(), v_lora.detach(), x[h:].clone())
+            if len(base.pages):
+                k_hl, v_hl, k_hb, v_hb = _rebuild_history_kv_decoupled(self, base.pages, rope_hist)
+                k_attn = torch.cat([torch.cat([k_hl, k_noisy], dim=1), torch.cat([k_hb, k_write], dim=1)])
+                v_attn = torch.cat([torch.cat([v_hl, v_noisy], dim=1), torch.cat([v_hb, v_write], dim=1)])
+            else:
+                k_attn, v_attn = torch.cat([k_noisy, k_write]), torch.cat([v_noisy, v_write])
+            return (self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2)), *page)
+        length = base.length
+        if length:
+            k_attn = _PageCatPairSplit.apply(lora.table.k[:, :length * s], base.table.k[:, :length * s], k_noisy, k_write,
+                                             len(lora.k_handles), *lora.k_handles, *base.k_handles)
+            v_attn = _PageCatPairSplit.apply(lora.table.v[:, :length * s], base.table.v[:, :length * s], v_noisy, v_write,
+                                             len(lora.v_handles), *lora.v_handles, *base.v_handles)
+        else:
+            k_attn, v_attn = torch.cat([k_noisy, k_write]), torch.cat([v_noisy, v_write])
+        y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
+        return y, k_write, v_write, k_lora, v_lora
     # ==== ours end ====
 
 
@@ -974,7 +1188,8 @@ class CausalWanAttentionBlock(nn.Module):
         cache_start=None,
         # ======== ours ========
         persistent=None,
-        memory_write=False
+        memory_write=False,
+        memory_base_cache=None
         # ==== ours end ====
     ):
         r"""
@@ -1001,7 +1216,7 @@ class CausalWanAttentionBlock(nn.Module):
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start,
             # ======== ours ========
-            memory_write=memory_write
+            memory_write=memory_write, memory_base_cache=memory_base_cache
             # ==== ours end ====
             )
 
@@ -1046,6 +1261,8 @@ class CausalWanAttentionBlock(nn.Module):
             return (x, *out)
         y, *page = out if write_page else (out,)     # page: (k, v), or (k, v, h) for h pages
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+        if isinstance(history, DecoupledRead):       # page: (k, v, k_lora, v_lora); the prompt K/V cache is the LoRA table's
+            history = history.lora
         x = x + self._cross_attn_persistent(self.norm3(x), context, history)
         y = self.ffn(
             (self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2))
@@ -1517,7 +1734,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         current_start: int = 0,
         cache_start: int = 0,
         # ======== ours ========
-        memory_write: bool = False
+        memory_write: bool = False,
+        # memory_lora_write "decoupled": the per-block base caches the memory write runs against (see
+        # CausalWanSelfAttention.forward); None otherwise
+        memory_base_cache: list = None
         # ==== ours end ====
     ):
         r"""
@@ -1616,6 +1836,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "cache_start": cache_start,
                         # ======== ours ========
                         "memory_write": memory_write,
+                        "memory_base_cache": None if memory_base_cache is None else memory_base_cache[block_index],
                         # ==== ours end ====
                     }
                 )
@@ -1633,6 +1854,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "cache_start": cache_start,
                         # ======== ours ========
                         "memory_write": memory_write,
+                        "memory_base_cache": None if memory_base_cache is None else memory_base_cache[block_index],
                         # ==== ours end ====
                     }
                 )
@@ -1914,7 +2136,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         rope = _rope_table(self.freqs, grid_sizes, frame_idx)
         # h pages: the RoPE table of the history frames 0..frame_idx-1, for the K/V rebuild
         rope_hist = (self._history_rope(grid_sizes, frame_idx)
-                     if frame_idx and isinstance(histories[0], HPageRead) else None)
+                     if frame_idx and isinstance(getattr(histories[0], "base", histories[0]), HPageRead) else None)
         x, pages = latent, []
         for first in range(0, n, g):
             last = min(first + g, n)
@@ -1947,7 +2169,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     def forward_clean_writer(self, latent, t, context, histories, frame_idx):
         """The memory write. Returns this frame's pages as (k0, v0, k1, v1, ...);
-        no head, since a clean frame only provides context."""
+        no head, since a clean frame only provides context. Handed
+        DecoupledReads (memory_lora_write "decoupled"), the base network writes
+        and the pages are (k0, v0, k_lora0, v_lora0, k1, ...)."""
         grid_sizes, e, e0, ctx = self._embed_frame(latent, t, context)
         _, pages = self._persistent_blocks(latent, e, e0, grid_sizes, ctx, histories, frame_idx,
                                            write_page=True, t_shape=t.shape)

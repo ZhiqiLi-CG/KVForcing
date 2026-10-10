@@ -12,6 +12,19 @@ from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+# ======== ours ========
+def memory_lora_write_mode(args):
+    """The config's memory_lora_write (coupled | decoupled; default coupled), refused when decoupled is asked
+    of a model without Memory-LoRA."""
+    mode = str(getattr(args, "memory_lora_write", "coupled") or "coupled")
+    if mode not in ("coupled", "decoupled"):
+        raise ValueError(f"memory_lora_write must be 'coupled' or 'decoupled'. Got {mode!r}.")
+    if mode == "decoupled" and not (getattr(args, "model_kwargs", None) or {}).get("memory_lora", False):
+        raise ValueError("memory_lora_write: decoupled needs model_kwargs.memory_lora: true.")
+    return mode
+# ==== ours end ====
+
+
 class BaseModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
@@ -264,8 +277,12 @@ class SelfForcingModel(BaseModel):
                 checkpoint_group=getattr(self.args, "kv_forcing_checkpoint_group", 1),
                 fuse_grad_forwards=getattr(self.args, "kv_forcing_fuse_grad_forwards", False),
                 page_mode=self._kv_forcing_page_mode(),
+                memory_lora_write=memory_lora_write_mode(self.args),
             )
             return
+        if memory_lora_write_mode(self.args) != "coupled":
+            raise ValueError("memory_lora_write: decoupled is implemented for grad_mode: kv_forcing only "
+                             f"(got grad_mode {getattr(self.args, 'grad_mode', 'self_forcing')!r}).")
         # ==== ours end ====
         self.inference_pipeline = SelfForcingTrainingPipeline(
             denoising_step_list=self.denoising_step_list,

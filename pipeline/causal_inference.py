@@ -47,6 +47,18 @@ class CausalInferencePipeline(torch.nn.Module):
         self.frame_seq_length = 1560
 
         self.kv_cache1 = None
+        # ======== ours ========
+        # memory_lora_write (configs/default_config.yaml): "coupled" writes the memory with (W + dW) into the one
+        # cache; "decoupled" keeps a second, base cache (kv_cache_base) that only the memory write reads and
+        # writes, so the write forward is the base network, and the write also puts its (W + dW) K/V into
+        # kv_cache1, which the generation forwards read.
+        self.memory_lora_write = str(getattr(args, "memory_lora_write", "coupled") or "coupled")
+        if self.memory_lora_write not in ("coupled", "decoupled"):
+            raise ValueError(f"memory_lora_write must be 'coupled' or 'decoupled'. Got {self.memory_lora_write!r}.")
+        if self.memory_lora_write == "decoupled" and not getattr(self.generator.model.blocks[0].self_attn, "memory_lora", False):
+            raise ValueError("memory_lora_write: decoupled needs a model with Memory-LoRA (model_kwargs.memory_lora: true).")
+        self.kv_cache_base = None
+        # ==== ours end ====
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
@@ -108,6 +120,12 @@ class CausalInferencePipeline(torch.nn.Module):
             num_blocks = (num_frames - 1) // self.num_frame_per_block
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
+        # ======== ours ========
+        if initial_latent is not None and self.memory_lora_write == "decoupled":
+            # the initial frames enter the cache through plain forwards, not memory writes: the base cache
+            # would miss them
+            raise NotImplementedError("memory_lora_write: decoupled supports text-to-video only (no initial_latent).")
+        # ==== ours end ====
 
         # Optional: enable the streaming long-video attention mode. This stores
         # un-roped K/V and re-applies RoPE with relative indices each step so the
@@ -180,6 +198,12 @@ class CausalInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 # drop streaming bookkeeping so each prompt starts a fresh window
                 self.kv_cache1[block_index].pop("stream_abs", None)
+            # ======== ours ========
+            for entry in (self.kv_cache_base or []):
+                entry["global_end_index"] = torch.tensor([0], dtype=torch.long, device=noise.device)
+                entry["local_end_index"] = torch.tensor([0], dtype=torch.long, device=noise.device)
+                entry.pop("stream_abs", None)
+            # ==== ours end ====
 
         # Step 2: Cache context feature
         current_start_frame = 0
@@ -304,6 +328,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_start=current_start_frame * self.frame_seq_length,
                 # ======== ours ========
                 memory_lora_write=True,   # this forward writes memory (Memory-LoRA uses W + dW here)
+                memory_lora_base_cache=self.kv_cache_base,   # decoupled: the write runs on the base cache
                 # ==== ours end ====
             )
 
@@ -429,6 +454,17 @@ class CausalInferencePipeline(torch.nn.Module):
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
+        # ======== ours ========
+        # memory_lora_write "decoupled": the base cache, same shape and bookkeeping (only memory writes use it)
+        self.kv_cache_base = None
+        if self.memory_lora_write == "decoupled":
+            self.kv_cache_base = [{
+                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+            } for _ in range(self.num_transformer_blocks)]
+        # ==== ours end ====
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """

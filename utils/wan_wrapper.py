@@ -248,7 +248,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         persistent_history=None,
         persistent_start: int = 0,
         # Memory-LoRA: mark the forward that writes memory so it uses (W + dW).
-        memory_lora_write: bool = False
+        memory_lora_write: bool = False,
+        # memory_lora_write "decoupled": the base KV cache (one dict per block) the memory write runs
+        # against; the write then puts its (W + dW) K/V into kv_cache (see CausalInferencePipeline)
+        memory_lora_base_cache: Optional[List[dict]] = None
         # ==== ours end ====
     ) -> torch.Tensor:
         # ======== ours ========
@@ -300,7 +303,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 current_start=current_start,
                 cache_start=cache_start,
                 # ======== ours ========
-                memory_write=memory_lora_write
+                memory_write=memory_lora_write,
+                memory_base_cache=memory_lora_base_cache
                 # ==== ours end ====
             ).permute(0, 2, 1, 3, 4)
         else:

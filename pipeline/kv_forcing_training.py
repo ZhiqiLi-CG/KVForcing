@@ -19,13 +19,20 @@ every activation alive.
 
 The rollout itself (exit-step draw, schedule, context noising, what is written)
 is the one Self Forcing runs.
+
+Memory-LoRA (model_kwargs.memory_lora) with memory_lora_write: decoupled: the
+write runs the base network (its own K/V W h, attending to base pages of the
+earlier writes) and writes two pages per layer from the same h, the base page
+(read by later writes) and the LoRA page (W + dW) h (read by later noisy
+forwards). Both page sets carry gradient. The default, coupled, writes one page
+with (W + dW) h that both read, and the write itself attends with it.
 """
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 
-from wan.modules.causal_model import PersistentKVStore
+from wan.modules.causal_model import PersistentKVStore, DecoupledRead
 
 
 class KVForcingTrainingPipeline:
@@ -45,6 +52,7 @@ class KVForcingTrainingPipeline:
         checkpoint_group: int = 1,
         fuse_grad_forwards: bool = False,
         page_mode: str = "kv",
+        memory_lora_write: str = "coupled",
         **kwargs,
     ):
         if cache_mode not in ("exit", "final_clean"):
@@ -89,6 +97,16 @@ class KVForcingTrainingPipeline:
             raise ValueError("page_mode 'h' rebuilds the history K/V inside checkpoint regions; "
                              "without checkpointing every rebuilt copy would be kept.")
         self.page_mode = page_mode
+        # memory_lora_write (Memory-LoRA models only): "coupled" (default) writes every page with (W + dW), and
+        # the write forward itself attends with them. "decoupled": the write forward is the BASE network (its
+        # own K/V W h, reading base pages written by the earlier write forwards), and from the same h it also
+        # writes the LoRA page (W + dW) h, which only the generation forwards read. Two page stores, one per
+        # reader; both carry gradient (CausalWanSelfAttention.forward_persistent_decoupled). Under page_mode "h"
+        # the page that carries the graph is the writer's h, ONE for both: the readers rebuild the LoRA (noisy) or
+        # the base (write) K/V from it, and the two stores share the h page tensors.
+        if memory_lora_write not in ("coupled", "decoupled"):
+            raise ValueError(f"memory_lora_write must be 'coupled' or 'decoupled'. Got {memory_lora_write!r}.")
+        self.memory_lora_write = memory_lora_write
 
     @property
     def _model(self):
@@ -115,6 +133,18 @@ class KVForcingTrainingPipeline:
             noisy_image_or_video=torch.cat([noisy, write]), conditional_dict=cond,
             timestep=torch.cat([noisy_t, write_t]),
             persistent_mode="fused", persistent_history=hist, persistent_start=start)
+
+    @staticmethod
+    def _append(store, base_store, pages):
+        """Appends a write forward's pages: (k0, v0, k1, v1, ...) to `store`, or, decoupled (base_store given),
+        (k0, v0, k_lora0, v_lora0, k1, ...): the base pages to base_store, the LoRA pages to store; under page_mode
+        "h" with gradient (k0, v0, k_lora0, v_lora0, h0, k1, ...): each store gets its K/V and the one h page."""
+        if base_store is None:
+            store.append_all_layers(pages)
+            return
+        w = len(pages) // store.num_layers
+        base_store.append_all_layers(tuple(p for i, p in enumerate(pages) if i % w in (0, 1, 4)))
+        store.append_all_layers(tuple(p for i, p in enumerate(pages) if i % w in (2, 3, 4)))
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         if dist.is_available() and dist.is_initialized():
@@ -168,6 +198,13 @@ class KVForcingTrainingPipeline:
         # one page-table slot per page; the last block writes none (see below)
         store = PersistentKVStore(len(model.blocks), max_frames=num_frames - self.num_frame_per_block,
                                   page_mode=self.page_mode)
+        # memory_lora_write "decoupled": `store` holds the LoRA pages (what the generation forwards read) and
+        # base_store the base pages (what the write forwards read)
+        decoupled = self.memory_lora_write == "decoupled"
+        if decoupled and not getattr(model.blocks[0].self_attn, "memory_lora", False):
+            raise ValueError("memory_lora_write: decoupled needs a model with Memory-LoRA (model_kwargs.memory_lora: true).")
+        base_store = (PersistentKVStore(len(model.blocks), max_frames=num_frames - self.num_frame_per_block,
+                                        page_mode=self.page_mode) if decoupled else None)
         outputs = []
         start = 0
         for _ in range(num_blocks):
@@ -176,6 +213,10 @@ class KVForcingTrainingPipeline:
             # what a forward WITHOUT gradient reads: the same per-layer histories,
             # except under page_mode "h" with grad enabled, where `hist` is the h pages
             ro_hist = store.table_all_layers() if self.page_mode == "h" else hist
+            # what the memory write reads: the same histories, or, decoupled, the base pages (and the LoRA
+            # table its LoRA page goes into)
+            write_hist = (tuple(DecoupledRead(lora, base) for lora, base in zip(hist, base_store.snapshot_all_layers()))
+                          if decoupled else hist)
             # the last block writes no page, so it has no write forward to fuse with
             fuse = self.fuse_grad_forwards and torch.is_grad_enabled() and start + n < num_frames
 
@@ -227,14 +268,16 @@ class KVForcingTrainingPipeline:
             else:
                 write_x, write_t = x0_cache, torch.zeros_like(context_timestep)
             if fuse:
-                out, pages = self._fused(exit_input, exit_t, write_x, write_t, conditional_dict, hist, start)
+                out, pages = self._fused(exit_input, exit_t, write_x, write_t, conditional_dict, write_hist, start)
                 outputs.append(out)
-                store.append_all_layers(pages)
+                self._append(store, base_store, pages)
             elif start + n < num_frames:
-                store.append_all_layers(self._write(write_x, write_t, conditional_dict, hist, start))
+                self._append(store, base_store, self._write(write_x, write_t, conditional_dict, write_hist, start))
             start += n
 
         store.end_rollout()
+        if base_store is not None:
+            base_store.end_rollout()
         output = torch.cat(outputs, dim=1)
 
         # The timestep window the sampled exit step corresponds to, for DMD.
