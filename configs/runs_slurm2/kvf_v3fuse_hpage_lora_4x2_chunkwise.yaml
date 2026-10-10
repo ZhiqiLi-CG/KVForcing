@@ -1,0 +1,88 @@
+# kvf_v3fuse_hpage_lora_4x2_chunkwise.yaml -- chunkwise 3+15+3 training run, slurm-2, written 2026-10-09.
+# = draft /mnt/data/zhiqili/causal_chunkwise_prep/configs/kvf_v3fuse_hpage_lora_4x2_chunkwise.yaml with its draft header replaced by this one (no key changed; checked by make_chunkwise_run_configs.py).
+# Differs from /mnt/data/zhiqili/causal_configs_slurm2/kvf_v0_lora_4x2.yaml (V3 = V0 + both perf switches; no framewise V3 run)
+#   ONLY in: generator_ckpt (init/framewise -> init/chunkwise), num_frame_per_block 1 -> 3, kv_forcing_fuse_grad_forwards true, kv_forcing_page_mode h (V3).
+#   model_kwargs.local_attn_size 18 and sink_size 3 are unchanged: sink 3 + window 18 = the whole 21-frame clip.
+# USER DECISIONS 2026-10-09: chunkwise 3+15+3 (not official SGF chunkwise 3+6+3); max_steps 1500 (official SGF chunkwise 1200);
+#   init = Causal-Forcing chunkwise causal_cd.pt (official SGF chunkwise: ar_diffusion.pt); training approved by the user
+#   after the code change and its tests (jobs 173807-173810, /mnt/data/zhiqili/causal_exp/chunkwise_kvforcing/).
+# Code: KVForcing 4caf16c + chunkwise.patch (lifts the num_frame_per_block == 1 guard, page table sized per block,
+#   h-page RoPE table per block); the training path of 4caf16c is identical to 78db8c3 used by the framewise runs.
+# ---------------- header of the framewise source, kept verbatim ----------------
+# slurm-2 copy of causal_essential/configs/kvf_v0_lora_4x2.yaml (2026-10-09): only generator_ckpt and data_path changed from the cks2 paths.
+# kvf_v0_lora_4x2: generated from configs/kv_forcing_lora_framewise.yaml of the code snapshot (/mnt/data/zhaofeng/tem_zhiqi/causal/kv_training_20261008/code) for the 4 GPU x batch 2 runs of 2026-10-08.
+# Changed against the repository config: seed 0 -> 1, batch_size 1 -> 2 (4 ranks, effective batch 8), absolute generator_ckpt /
+# data_path, step_time_log_interval 50 (timing log only).
+# KV Forcing with Memory-LoRA: the memory write uses its own K/V projection (W + dW),
+# generation keeps W. dW is a zero-initialised rank-64 adapter with its own learning rate.
+# Build the init checkpoint first:
+#   python scripts/make_lora_init.py checkpoints/init/framewise/causal_cd.pt checkpoints/init/framewise/causal_cd_lora_init.pt
+# Causal-Forcing consistency-distilled initialization (scripts/download_weights.sh).
+# init/framewise/ar_diffusion.pt is the other released starting point.
+generator_ckpt: /mnt/home/zhiqili/causal/KVForcing-resume/checkpoints/init/chunkwise/causal_cd_lora_init.pt  # Causal-Forcing chunkwise causal_cd.pt + Memory-LoRA init made from it (up = 0), sha256 1bb5db0498c286c6..., see /mnt/data/zhiqili/causal_chunkwise_prep/PROVENANCE_causal_cd_lora_init_chunkwise.txt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+fake_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+# Precision: bf16 mixed precision (FSDP casts weights/activations to bf16; fp32 master
+# weights, optimizer state and gradient reduction), the recipe SGF / Causal-Forcing train with.
+# The fp32 twin of this file is <name>_fp32.yaml; the two differ in this block only.
+mixed_precision: true
+seed: 1
+wandb_host: https://api.wandb.ai
+wandb_key: {your key}
+wandb_entity: {your entity}
+wandb_project: {your project}
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+lr_memory_lora: 1.0e-04
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+batch_size: 2
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 8
+log_iters: 50
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+max_steps: 1500
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3  # official chunkwise.yaml:49 (framewise.yaml:49 = 1): 3 latent frames per AR block
+load_raw_video: false
+model_kwargs:
+  model_name: Wan2.1-T2V-1.3B
+  timestep_shift: 5.0
+  local_attn_size: 18  # USER DECISION 2026-10-09: chunkwise 3+15+3 = sink 3 + window 18 (incl. the current block) = the full 21-frame clip, as Causal Forcing / Self Forcing (local_attn_size -1) see it; official SGF chunkwise uses 9 (chunkwise.yaml:54)
+  sink_size: 3
+  memory_lora: true
+data_path: /mnt/home/zhiqili/causal/KVForcing-resume/prompts/vidprom_filtered_extended.txt
+grad_mode: kv_forcing
+step_time_log_interval: 50
+# full-state resume (hpc-low is preemptible): state saved every 100 steps to <logdir>/resume
+resume_every: 100
+kv_forcing_fuse_grad_forwards: true
+kv_forcing_page_mode: h

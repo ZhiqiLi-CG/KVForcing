@@ -1931,10 +1931,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         model: the forwards of a rollout then share it instead of each keeping
         its own from forward to backward."""
         key = (tuple(grid_sizes[0].tolist()), self.freqs.device)
-        tokens = frames * int(grid_sizes[0].prod())
+        # `frames` history FRAMES (= frame_idx); a grid holds f = num_frame_per_block of them, so the history is
+        # frames // f grids (chunkwise fix 2026-10-09; framewise f = 1: unchanged)
+        f = int(grid_sizes[0][0])
+        assert frames % f == 0, (frames, f)
+        tokens = (frames // f) * int(grid_sizes[0].prod())
         cached = getattr(self, "_history_rope_cache", None)
         if cached is None or cached[0] != key or cached[1].shape[0] < tokens:
-            cached = (key, _rope_table(self.freqs, grid_sizes, 0, frames=frames))
+            cached = (key, _rope_table(self.freqs, grid_sizes, 0, frames=frames // f))
             self._history_rope_cache = cached
         return cached[1][:tokens]
 

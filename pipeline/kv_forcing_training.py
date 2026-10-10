@@ -49,11 +49,11 @@ class KVForcingTrainingPipeline:
     ):
         if cache_mode not in ("exit", "final_clean"):
             raise ValueError(f"cache_mode must be 'exit' or 'final_clean'. Got {cache_mode!r}.")
-        if num_frame_per_block != 1:
-            raise ValueError(
-                "KV Forcing is implemented and verified for num_frame_per_block=1; got "
-                f"{num_frame_per_block}. A block is written as one page, so intra-block "
-                "visibility for chunkwise models is not defined here.")
+        # chunkwise (2026-10-09): a block of num_frame_per_block frames is denoised together and written as ONE
+        # page. Within a block every frame sees the whole block (the page forwards attend to [history pages,
+        # own K/V] without a causal mask, as the KV-cache inference path reads the whole current block), across
+        # blocks attention is causal. Verified with scripts/eval/check_train_eval_consistency.py on chunkwise
+        # configs (num_frame_per_block 3, local_attn_size 18 + sink_size 3).
         self.denoising_step_list = denoising_step_list
         if self.denoising_step_list[-1] == 0:
             self.denoising_step_list = self.denoising_step_list[:-1]
@@ -166,7 +166,8 @@ class KVForcingTrainingPipeline:
         model.persistent_block_checkpointing = self.gradient_checkpointing
         model.persistent_checkpoint_group = self.checkpoint_group
         # one page-table slot per page; the last block writes none (see below)
-        store = PersistentKVStore(len(model.blocks), max_frames=num_frames - self.num_frame_per_block,
+        # one slot per page = per block; the last block writes none (framewise: num_frames - 1 as before)
+        store = PersistentKVStore(len(model.blocks), max_frames=num_blocks - 1,
                                   page_mode=self.page_mode)
         outputs = []
         start = 0

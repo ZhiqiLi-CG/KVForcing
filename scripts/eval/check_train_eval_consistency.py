@@ -425,6 +425,10 @@ else:
 
 R["fails"], R["notes"], R["seconds_total"] = fails, notes, time.time() - t_start
 R["verdict"] = "FAIL" if fails else "PASS"
+# slurm-2 2026-10-09: with SAVE_LATENTS=1 also keep the rollouts themselves (A plain, B long_video, C training, D context
+# noise), so that two code versions can be compared element by element, not only through their A/B/C summaries.
+if OUT and os.environ.get("SAVE_LATENTS") == "1":
+    torch.save({k: globals()[k].detach().cpu() for k in ("A", "B", "C", "D") if k in globals()}, OUT[:-5] + "_latents.pt")
 if OUT:
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w") as f:
