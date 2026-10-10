@@ -9,6 +9,9 @@ from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
+# ======== ours ========
+from wan.modules.causal_model import memory_lora_distance_gate_mode
+# ==== ours end ====
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -121,7 +124,10 @@ class WanDiffusionWrapper(torch.nn.Module):
             local_attn_size=-1,
             sink_size=0,
             # ======== ours ========
-            memory_lora=False
+            memory_lora=False,
+            # Memory-LoRA distance gate (top-level config key memory_lora_distance_gate): none | scalar | rank |
+            # channel | input. Only passed on when set, so "none" builds exactly the model it built before.
+            memory_lora_distance_gate=None
             # ==== ours end ====
     ):
         super().__init__()
@@ -131,6 +137,11 @@ class WanDiffusionWrapper(torch.nn.Module):
             # Memory-LoRA adapters are absent from the pretrained files, so the
             # meta-device fast path (which refuses uninitialised keys) is off.
             lora_kwargs = dict(memory_lora=True, low_cpu_mem_usage=False, device_map=None) if memory_lora else {}
+            gate = memory_lora_distance_gate_mode(memory_lora_distance_gate)
+            if gate is not None:
+                if not memory_lora:
+                    raise ValueError("memory_lora_distance_gate needs model_kwargs.memory_lora: true")
+                lora_kwargs["memory_lora_distance_gate"] = gate
             # ==== ours end ====
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size,
@@ -139,6 +150,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 # ==== ours end ====
                 )
         else:
+            # ======== ours ========
+            if memory_lora_distance_gate_mode(memory_lora_distance_gate) is not None:
+                raise ValueError("memory_lora_distance_gate is for the causal generator only")
+            # ==== ours end ====
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()
 

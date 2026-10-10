@@ -7,6 +7,7 @@ import torch
 from pipeline import SelfForcingTrainingPipeline,TeacherForcingTrainingPipeline,BidirectionalTrainingPipeline
 # ======== ours ========
 from pipeline import KVForcingTrainingPipeline
+from wan.modules.causal_model import memory_lora_distance_gate_from_config
 # ==== ours end ====
 from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -45,7 +46,17 @@ class BaseModel(nn.Module):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
         self.iscausal = getattr(args, "causal", True)
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=self.iscausal)
+        # ======== ours ========
+        # Memory-LoRA distance gate (top-level memory_lora_distance_gate): passed to the generator only when set.
+        # The gated pages exist in the KV Forcing rollout only; the cache-based training rollouts are refused.
+        gen_kwargs = dict(getattr(args, "model_kwargs", {}))
+        gate = memory_lora_distance_gate_from_config(args)
+        if gate is not None:
+            if getattr(args, "grad_mode", "self_forcing") != "kv_forcing":
+                raise ValueError("memory_lora_distance_gate is implemented for grad_mode: kv_forcing only")
+            gen_kwargs["memory_lora_distance_gate"] = gate
+        self.generator = WanDiffusionWrapper(**gen_kwargs, is_causal=self.iscausal)
+        # ==== ours end ====
         self.generator.model.requires_grad_(True)
 
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)

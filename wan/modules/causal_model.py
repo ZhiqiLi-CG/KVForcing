@@ -105,6 +105,41 @@ def causal_rope_apply_frames(x, grid_sizes, freqs, frame_indices):
 
 
 # ======== ours ========
+# ======== ours (Memory-LoRA distance gate) ========
+# memory_lora_distance_gate (top-level config key): the Memory-LoRA contribution of a cached frame depends on its
+# distance d = clamp(pos_query - pos_key, 0, 20) in temporal RoPE positions to the frame being computed (d = 0 for
+# a frame's own K/V). Per layer, separately for K and V (z = down(x), u = up(z) * scale = the ungated dW x):
+#   scalar   dW(d) x = g_d * u                 g in R^{21}           init 1
+#   rank     dW(d) x = up(g_d (.) z) * scale    g in R^{21 x rank}    init 1
+#   channel  dW(d) x = g_d (.) u                g in R^{21 x dim}     init 1
+#   input    dW(d) x = up(down(x + b_d)) * scale = up(z + down(b_d)) * scale (down is linear, no bias)
+#                                              b in R^{21 x dim}     init 0
+#   mix      every memory write keeps BOTH versions of its K/V, K^L = RoPE(norm_k(W_k x + dW_k x)), K^0 = RoPE(norm_k(W_k x)),
+#            V^L = W_v x + dW_v x, V^0 = W_v x; a reader at distance d uses K = g_d K^L + (1 - g_d) K^0 (after norm_k and
+#            RoPE) and V = V^0 + g'_d dW_v x (= g'_d V^L + (1 - g'_d) V^0), g = sigmoid(theta)
+#                                              theta in R^{21}       init 0 (g = 0.5; NOT the ungated model, which is g = 1)
+# At init the variants scalar, rank, channel, input are the ungated Memory-LoRA. "none" (default) builds no gate and leaves every code path as
+# it was. A gated page is read at a different distance by every later frame, so a gated layer keeps the parts of a
+# memory write that do not depend on the reader (W_k x and W_v x before norm_k / RoPE, and z_k, z_v) and builds
+# K = RoPE(norm_k(W_k x + dW_k(d) x)), V = W_v x + dW_v(d) x when it reads them (CausalWanSelfAttention._gated_kv).
+MEMORY_LORA_GATE_DISTANCES = 21          # d = 0..20, the 21-frame training clip
+MEMORY_LORA_DISTANCE_GATES = ("scalar", "rank", "channel", "input", "mix")
+
+
+def memory_lora_distance_gate_mode(value):
+    """The config value of memory_lora_distance_gate as the model takes it: None for no gate."""
+    if value is None or value is False or str(value).lower() in ("", "none"):
+        return None
+    if value not in MEMORY_LORA_DISTANCE_GATES:
+        raise ValueError(f"memory_lora_distance_gate must be none or one of {MEMORY_LORA_DISTANCE_GATES}; got {value!r}")
+    return value
+
+
+def memory_lora_distance_gate_from_config(config):
+    return memory_lora_distance_gate_mode(getattr(config, "memory_lora_distance_gate", None))
+# ==== ours end ====
+
+
 class MemoryLoRA(nn.Module):
     """Low-rank update to a projection weight: dW h = up(down(h)) * scale.
 
@@ -113,20 +148,62 @@ class MemoryLoRA(nn.Module):
     and the pretrained model is reproduced at step 0.
     """
 
-    def __init__(self, dim, rank=64, alpha=None):
+    def __init__(self, dim, rank=64, alpha=None,
+                 # ======== ours (distance gate) ========
+                 distance_gate=None
+                 # ==== ours end ====
+                 ):
         super().__init__()
         self.rank = rank
         self.scale = (alpha if alpha is not None else rank) / rank
         self.down = nn.Linear(dim, rank, bias=False)
         self.up = nn.Linear(rank, dim, bias=False)
+        # ======== ours (distance gate) ========
+        self.gate_mode = memory_lora_distance_gate_mode(distance_gate)
+        if self.gate_mode is not None:
+            n = MEMORY_LORA_GATE_DISTANCES
+            shape = {"scalar": (n,), "rank": (n, rank), "channel": (n, dim), "input": (n, dim), "mix": (n,)}[self.gate_mode]
+            self.distance_gate = nn.Parameter(torch.empty(shape))
+        # ==== ours end ====
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.normal_(self.down.weight, std=1.0 / self.rank)
         nn.init.zeros_(self.up.weight)
+        # ======== ours (distance gate) ========
+        if self.gate_mode is not None:
+            self.reset_distance_gate()
+        # ==== ours end ====
 
     def forward(self, x):
         return self.up(self.down(x)) * self.scale
+
+    # ======== ours (distance gate) ========
+    @torch.no_grad()
+    def reset_distance_gate(self):
+        """The init: g = 1 (scalar, rank, channel), b = 0 (input) -- the identity; theta = 0 (mix: g = 0.5)."""
+        self.distance_gate.fill_(0.0 if self.gate_mode in ("input", "mix") else 1.0)
+
+    def mix_weight(self, dist):
+        """mix: g_d = sigmoid(theta_d) of the distances `dist` (LongTensor [m])."""
+        return torch.sigmoid(self.distance_gate.index_select(0, dist))
+
+    def gated(self, z, dist):
+        """dW(d) x of m frames from z = down(x) [B, m, L, rank], frame j at distance dist[j] (LongTensor [m]).
+        Returns [B, m, L, dim]. With the identity gate it is forward(x), op for op (a factor 1 or a term 0 aside)."""
+        m = dist.numel()
+        if self.gate_mode == "input":
+            # down(b_d) of all 21 distances in ONE fixed-shape GEMM, then the rows of `dist`: a frame's down(b_d)
+            # does not depend on how many / which distances a forward reads (a GEMM over another number of rows may
+            # reduce in another order, and training and inference read different sets of frames)
+            return self.up(z + self.down(self.distance_gate).index_select(0, dist).view(1, m, 1, -1)) * self.scale
+        g = self.distance_gate.index_select(0, dist)
+        if self.gate_mode == "scalar":
+            return self.up(z) * self.scale * g.view(1, m, 1, 1)
+        if self.gate_mode == "channel":
+            return self.up(z) * self.scale * g.view(1, m, 1, -1)
+        return self.up(z * g.view(1, m, 1, -1)) * self.scale        # rank
+    # ==== ours end ====
 # ==== ours end ====
 
 
@@ -382,6 +459,108 @@ def _rebuild_history_kv(attn, pages, rope_hist):
     return _rope_apply(k, rope_hist).type_as(v), v
 
 
+# ======== ours (distance gate) ========
+# Pages of a gated model. The page of frame j in one layer is its four PARTS (W_k x, W_v x, down_k(x), down_v(x))
+# in the dtype the layer computes in (K is built from them before norm_k, so they are not rounded to flash-attn's
+# dtype), and the reader builds K, V at its own distance (CausalWanSelfAttention._gated_history). The slot of
+# page j is frame j: pages are appended frame by frame from frame 0, so the reader of a history of m pages is
+# frame m, the page in slot j sits at RoPE position j, and d = m - j.
+GATED_PAGE_PARTS = 4
+
+
+class _PartsTable:
+    """_PageTable of a gated layer: one contiguous buffer [B, max_frames * L, C] per part, page j in rows
+    [j * L, (j + 1) * L), allocated on first use and only ever appended to. Also holds the prompt's
+    cross-attention K/V of the forwards without gradient (context_kv), as _PageTable does."""
+
+    def __init__(self, max_frames):
+        self.max_frames = max_frames
+        self.parts = None
+        self.tokens = None
+        self.context_kv = None
+        # the history K, V the forwards WITHOUT gradient of the current frame read: every such forward of a frame
+        # (its denoising steps, the write of a critic-step rollout) reads the same pages at the same distances, so
+        # the first builds them and the others reuse them; keyed by (pages, tokens per frame), dropped by end_rollout
+        self.hist_kv = None
+
+    def put(self, slot, *parts):
+        L = parts[0].shape[1]
+        if self.parts is None:
+            self.tokens = L
+            self.parts = tuple(p.new_empty((p.shape[0], self.max_frames * L, *p.shape[2:])) for p in parts)
+        for buf, p in zip(self.parts, parts):
+            buf[:, slot * L:(slot + 1) * L].copy_(p)
+
+    def view(self, length):
+        return tuple(buf[:, :length * self.tokens] for buf in self.parts)
+
+
+class GatedPageRead(NamedTuple):
+    """PageRead of a gated layer: the table, the number of pages, and per page the handles of its four parts
+    (empty when the pages carry no graph)."""
+    table: _PartsTable
+    length: int
+    handles: tuple
+
+
+class _PageParts(torch.autograd.Function):
+    """One part of a gated layer's history pages, [B, length * L, C], for a forward with gradient: a fresh copy of
+    the table's rows, whose backward hands each page's handle its slice of the gradient as its own contiguous
+    tensor (the reason _PageCat gives). The copy also keeps every op that saves its input for the backward pass
+    (the gate, norm_k) off the page table, which later pages are written into."""
+
+    @staticmethod
+    def forward(ctx, history, *handles):
+        ctx.sizes = [h.shape[1] for h in handles]
+        return history.clone(memory_format=torch.contiguous_format)
+
+    @staticmethod
+    def backward(ctx, grad):
+        pages = grad.split(ctx.sizes, dim=1) if ctx.sizes else ()
+        return (None, *(g.clone(memory_format=torch.contiguous_format) for g in pages))
+
+
+class GatedPersistentKVStore(PersistentKVStore):
+    """PersistentKVStore of a model with a Memory-LoRA distance gate: a page is the four parts of a memory write
+    (GATED_PAGE_PARTS), kept in a _PartsTable per layer; with page_mode "h" the writer with gradient appends
+    (parts detached, h) and the h page carries the graph, as in PersistentKVStore."""
+
+    def __init__(self, num_layers, max_frames, page_mode="kv"):
+        super().__init__(num_layers, max_frames, page_mode)
+        self.tables = [_PartsTable(max_frames) for _ in range(num_layers)]
+        self.handles = [[] for _ in range(num_layers)]
+
+    def append_all_layers(self, flat_pages):
+        """flat_pages: (ka0, va0, zk0, zv0, ka1, ...), or (ka0, va0, zk0, zv0, h0, ...) with the parts detached
+        from a writer with gradient under page_mode "h"."""
+        width = len(flat_pages) // self.num_layers
+        assert width in (GATED_PAGE_PARTS, GATED_PAGE_PARTS + 1), width
+        for layer_idx in range(self.num_layers):
+            parts = flat_pages[width * layer_idx:width * layer_idx + GATED_PAGE_PARTS]
+            with torch.no_grad():
+                self.tables[layer_idx].put(self.length, *parts)
+            if width == GATED_PAGE_PARTS + 1:
+                self.h_pages[layer_idx].append(flat_pages[width * layer_idx + GATED_PAGE_PARTS])
+            elif parts[0].requires_grad:
+                self.handles[layer_idx].append(tuple(_PageHandle.apply(p) for p in parts))
+        self.length += 1
+
+    def snapshot_all_layers(self):
+        if self.page_mode == "h" and torch.is_grad_enabled():
+            return tuple(HPageRead(tuple(self.h_pages[l])) for l in range(self.num_layers))
+        return tuple(GatedPageRead(self.tables[l], self.length, tuple(self.handles[l]))
+                     for l in range(self.num_layers))
+
+    def table_all_layers(self):
+        return tuple(GatedPageRead(self.tables[l], self.length, ()) for l in range(self.num_layers))
+
+    def end_rollout(self):
+        super().end_rollout()
+        for table in self.tables:
+            table.hist_kv = None
+# ==== ours end ====
+
+
 def _rope_table(freqs, grid_sizes, start_frame, frames=1):
     """The multiplier causal_rope_apply builds on every call, [L, 1, c] complex128,
     for a frame grid at absolute frame `start_frame` (every sample has the same
@@ -458,7 +637,8 @@ class CausalWanSelfAttention(nn.Module):
                  qk_norm=True,
                  eps=1e-6,
                  # ======== ours ========
-                 memory_lora=False
+                 memory_lora=False,
+                 memory_lora_distance_gate=None
                  # ==== ours end ====
                  ):
         assert dim % num_heads == 0
@@ -503,9 +683,13 @@ class CausalWanSelfAttention(nn.Module):
         # Memory-LoRA: the memory writer's K/V projection is (W + dW), applied
         # to W_k h / W_v h BEFORE norm_k, i.e. really (W + dW) h.
         self.memory_lora = memory_lora
+        # distance gate (see MemoryLoRA.gated); None = the ungated Memory-LoRA, code paths unchanged
+        self.distance_gate = memory_lora_distance_gate_mode(memory_lora_distance_gate)
+        if self.distance_gate is not None and not memory_lora:
+            raise ValueError("memory_lora_distance_gate needs model_kwargs.memory_lora: true")
         if memory_lora:
-            self.k_memory_lora = MemoryLoRA(dim)
-            self.v_memory_lora = MemoryLoRA(dim)
+            self.k_memory_lora = MemoryLoRA(dim, distance_gate=self.distance_gate)
+            self.v_memory_lora = MemoryLoRA(dim, distance_gate=self.distance_gate)
         # ==== ours end ====
 
     def forward(
@@ -535,6 +719,10 @@ class CausalWanSelfAttention(nn.Module):
         if persistent is not None:
             return self.forward_persistent(x, **persistent)
         # ==== ours end ====
+        # ======== ours (distance gate) ========
+        if self.distance_gate is not None and kv_cache is not None:
+            return self._forward_cache_gated(x, grid_sizes, freqs, kv_cache, current_start, memory_write)
+        # ==== ours end ====
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
             cache_start = current_start
@@ -546,6 +734,9 @@ class CausalWanSelfAttention(nn.Module):
         dk = dv = None
         if self.memory_lora:
             is_tf_seq = kv_cache is None and (s == seq_lens[0].item() * 2)
+            if is_tf_seq and self.distance_gate is not None:      # (distance gate)
+                raise NotImplementedError("memory_lora_distance_gate: the teacher-forced forward attends to every "
+                                          "clean frame at once and cannot give a key a K per reader")
             if is_tf_seq or (kv_cache is not None and memory_write):
                 dk, dv = self.k_memory_lora(x), self.v_memory_lora(x)
                 if is_tf_seq:
@@ -798,6 +989,211 @@ class CausalWanSelfAttention(nn.Module):
         x = self.o(x)
         return x
 
+    # ======== ours (distance gate) ========
+    def _gated_kv(self, ka, va, zk, zv, dist, mem=None):
+        """K (before RoPE) and V [B, m * L, n, d] of m frames of L tokens from their parts ka = W_k x, va = W_v x
+        [B, m * L, dim] and zk = down_k(x), zv = down_v(x) [B, m * L, rank], frame j read at distance dist[j]:
+        K = norm_k(W_k x + dW_k(d) x), V = W_v x + dW_v(d) x. mem [m] (0 or 1) drops the Memory-LoRA of a frame
+        that was not a memory write (inference cache only)."""
+        b, L = ka.shape[:2]
+        m = dist.numel()
+        s = L // m
+        dk = self.k_memory_lora.gated(zk.reshape(b, m, s, -1), dist)
+        dv = self.v_memory_lora.gated(zv.reshape(b, m, s, -1), dist)
+        if mem is not None:
+            mem = mem.to(dk.dtype).view(1, m, 1, 1)
+            dk, dv = dk * mem, dv * mem
+        kk = ka + dk.view(b, L, -1)
+        vv = va + dv.view(b, L, -1)
+        return self.norm_k(kk).view(b, L, self.num_heads, self.head_dim), vv.view(b, L, self.num_heads, self.head_dim)
+
+    def _mix_kv(self, kL, k0, v0, zv, dist, mem=None):
+        """mix: K, V [B, m * L, n, d] of m frames of L tokens read at distances dist [m]:
+        K = g_d K^L + (1 - g_d) K^0 with K^L, K^0 after norm_k and RoPE [B, m * L, n, d], computed in their dtype;
+        V = V^0 + g'_d (up_v(z_v) * scale), V^0 = W_v x [B, m * L, n, d], z_v = down_v(x) [B, m * L, rank];
+        g = sigmoid(theta) of the K / V gate. g = 1 gives K^L and W_v x + dW_v x as the ungated memory write computes
+        them (a factor 1 and a term 0 aside, op for op), g = 0 gives K^0, W_v x. mem [m] (0/1, inference cache only)
+        multiplies g: a slot that was not a memory write reads as K^0, V^0."""
+        b, Lt = kL.shape[:2]
+        m = dist.numel()
+        s = Lt // m
+        n, d = self.num_heads, self.head_dim
+        gk, gv = self.k_memory_lora.mix_weight(dist), self.v_memory_lora.mix_weight(dist)
+        if mem is not None:
+            gk, gv = gk * mem.to(gk.dtype), gv * mem.to(gv.dtype)
+        gk = gk.to(kL.dtype).view(1, m, 1, 1, 1)
+        k = gk * kL.reshape(b, m, s, n, d) + (1 - gk) * k0.reshape(b, m, s, n, d)
+        u = self.v_memory_lora.up(zv.reshape(b, m, s, -1)) * self.v_memory_lora.scale
+        v = v0.reshape(b, m, s, n * d) + u * gv.to(u.dtype).view(1, m, 1, 1)
+        return k.view(b, Lt, n, d), v.view(b, Lt, n, d)
+
+    def _mix_parts_from_h(self, hh, rope_hist):
+        """mix: the page parts (K^L, K^0 roped and in the page dtype, V^0, z_v) of h pages hh [B, m * L, dim], with the
+        writers' ops (h pages with gradient)."""
+        b, Lt = hh.shape[:2]
+        n, d = self.num_heads, self.head_dim
+        kk, vv = self.k(hh), self.v(hh)
+        kkL = kk + self.k_memory_lora(hh)
+        v0 = vv.view(b, Lt, n, d)
+        ad = _attn_dtype(v0.dtype)
+        kL = _rope_apply(self.norm_k(kkL).view(b, Lt, n, d), rope_hist).type_as(v0).to(ad)
+        k0 = _rope_apply(self.norm_k(kk).view(b, Lt, n, d), rope_hist).type_as(v0).to(ad)
+        return kL, k0, v0, self.v_memory_lora.down(hh)
+
+    @staticmethod
+    def _gated_own(lora, z):
+        """dW(0) x [B, L, dim] of a frame's own K or V (d = 0) from z = down(x) [B, L, rank]: the GEMMs of
+        lora(x) on the same rows, so with the identity gate it is lora(x) bit for bit."""
+        b, s = z.shape[:2]
+        d0 = torch.zeros(1, dtype=torch.long, device=z.device)
+        return lora.gated(z.view(b, 1, s, -1), d0).view(b, s, -1)
+
+    def _forward_cache_gated(self, x, grid_sizes, freqs, kv_cache, current_start, memory_write):
+        """forward() with a KV cache for a model with a Memory-LoRA distance gate (inference). The same cache
+        bookkeeping as the plain path (sink + local window, eviction) and as the --long_video path (kv_rope_relative:
+        positions relative to the window), on these per-token buffers of the cache dict:
+          k, v     W_k x, W_v x before norm_k and RoPE (the dict's own "k", "v" buffers)
+          zk, zv   down_k(x), down_v(x)                 (allocated here on first use)
+          mem      1 where the slot was written by a memory write (memory_write=True), else 0
+          pos      the RoPE frame position the slot was written at (plain path)
+        Every forward rebuilds the K, V of the frames it reads for ITS query position q: frame j at RoPE position
+        p_j is read at d = clamp(q - p_j, 0, 20), K_j = RoPE_{p_j}(norm_k(W_k x_j + mem_j dW_k(d) x_j)),
+        V_j = W_v x_j + mem_j dW_v(d) x_j. The current frame is one of them (d = 0, mem = memory_write), so the
+        generation forwards attend to their own K/V without the Memory-LoRA, as before. With the identity gate
+        this is the ungated path to rounding (the up projection runs over all read frames at once)."""
+        if torch.is_grad_enabled():
+            raise RuntimeError("memory_lora_distance_gate: the KV-cache path is for inference (no gradient); "
+                               "train with grad_mode kv_forcing")
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        fs = math.prod(grid_sizes[0][1:]).item()
+        if s != fs:
+            raise NotImplementedError("memory_lora_distance_gate: one frame per forward (num_frame_per_block 1)")
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        ka, va = self.k(x), self.v(x)
+        cur = current_start // fs
+        mix = self.distance_gate == "mix"
+        zv = self.v_memory_lora.down(x)
+        if mix:
+            # mix: K^L, K^0 after norm_k ("k", "k0"; after RoPE at the slot's position in the plain path, which keeps
+            # roped K as ungated; the --long_video path ropes per read, as ungated), V^0 ("v"), z_v. A forward that is
+            # not a memory write keeps K^0 in both (it is read with g = 0).
+            k0 = self.norm_k(ka).view(b, s, n, d)
+            kL = self.norm_k(ka + self.k_memory_lora(x)).view(b, s, n, d) if memory_write else k0
+            if not self.kv_rope_relative:
+                k0 = causal_rope_apply(k0, grid_sizes, freqs, start_frame=cur).type_as(va)
+                kL = causal_rope_apply(kL, grid_sizes, freqs, start_frame=cur).type_as(va) if memory_write else k0
+            new = dict(k=kL, v=va.view(b, s, n, d), k0=k0, zv=zv)
+            extras = {"k0": (n, d), "zv": (zv.shape[-1],)}
+        else:
+            zk = self.k_memory_lora.down(x)
+            new = dict(k=ka.view(b, s, n, d), v=va.view(b, s, n, d), zk=zk, zv=zv)
+            extras = {"zk": (zk.shape[-1],), "zv": (zv.shape[-1],)}
+        buf_k = kv_cache["k"]
+        size = buf_k.shape[1]
+        for key, tail in extras.items():
+            if kv_cache.get(key) is None or tuple(kv_cache[key].shape) != (buf_k.shape[0], size, *tail):
+                kv_cache[key] = buf_k.new_zeros(buf_k.shape[0], size, *tail)
+        if kv_cache.get("mem") is None or kv_cache["mem"].shape[1] != size:
+            kv_cache["mem"] = buf_k.new_zeros(1, size)
+            kv_cache["pos"] = torch.zeros(1, size, dtype=torch.long, device=buf_k.device)
+        names = ("k", "v") + tuple(extras) + ("mem", "pos")
+
+        def write(lo, hi):
+            for key, val in new.items():
+                kv_cache[key][:, lo:hi] = val
+            kv_cache["mem"][:, lo:hi] = 1.0 if memory_write else 0.0
+            kv_cache["pos"][:, lo:hi] = cur
+
+        def shift(dst_lo, src_lo, length):
+            for key in names:
+                kv_cache[key][:, dst_lo:dst_lo + length] = kv_cache[key][:, src_lo:src_lo + length].clone()
+
+        if self.kv_rope_relative:
+            # the --long_video bookkeeping of forward(), on all buffers
+            max_frames, sink = self.kv_cache_max_frames, self.kv_cache_sink
+            abs_list = kv_cache.get("stream_abs", None)
+            if abs_list is None:
+                abs_list = []
+                kv_cache["stream_abs"] = abs_list
+            new_block_abs = [cur]
+            if len(abs_list) >= 1 and abs_list[-1:] == new_block_abs:
+                tail_slot = len(abs_list) - 1
+            else:
+                n_after = len(abs_list) + 1
+                if n_after > max_frames:
+                    num_evict = n_after - max_frames
+                    src_lo, src_hi, dst_lo = (sink + num_evict) * fs, len(abs_list) * fs, sink * fs
+                    if src_hi > src_lo:
+                        shift(dst_lo, src_lo, src_hi - src_lo)
+                    del abs_list[sink:sink + num_evict]
+                abs_list.extend(new_block_abs)
+                tail_slot = len(abs_list) - 1
+            write(tail_slot * fs, (tail_slot + 1) * fs)
+            num_occ = len(abs_list)
+            if self.kv_cache_position_mode == "contiguous":
+                pos = torch.arange(num_occ, device=q.device, dtype=torch.long)
+            else:
+                n_win = num_occ - sink
+                if n_win <= 0:
+                    pos = torch.arange(num_occ, device=q.device, dtype=torch.long)
+                else:
+                    Q = min(int(cur), self.kv_cache_train_frames - 1)
+                    pos = torch.cat([
+                        torch.arange(sink, device=q.device, dtype=torch.long),
+                        torch.arange(Q - (n_win - 1), Q + 1, device=q.device, dtype=torch.long),
+                    ])
+            read = {key: kv_cache[key][:, :num_occ * fs] for key in names[:5]}
+            q_pos = pos[tail_slot:tail_slot + 1]
+            roped_query = causal_rope_apply_frames(q, grid_sizes, freqs, q_pos).type_as(va)
+            pos_frames = pos
+            new_global, new_local = current_start + s, num_occ * fs
+        else:
+            # the plain bookkeeping of forward(), on all buffers
+            current_end = current_start + s
+            sink_tokens = self.sink_size * fs
+            local_end, global_end = kv_cache["local_end_index"].item(), kv_cache["global_end_index"].item()
+            if self.local_attn_size != -1 and current_end > global_end and s + local_end > size:
+                num_evicted = s + local_end - size
+                num_rolled = local_end - num_evicted - sink_tokens
+                shift(sink_tokens, sink_tokens + num_evicted, num_rolled)
+                local_end_index = local_end + current_end - global_end - num_evicted
+            else:
+                local_end_index = local_end + current_end - global_end
+            write(local_end_index - s, local_end_index)
+            win_lo = max(0, local_end_index - self.max_attention_size)
+            if self.local_attn_size != -1 and sink_tokens > 0 and win_lo > sink_tokens:
+                read = {key: torch.cat([kv_cache[key][:, :sink_tokens], kv_cache[key][:, win_lo:local_end_index]],
+                                       dim=1) for key in names}
+            else:
+                lo = 0 if (self.local_attn_size != -1 and sink_tokens > 0) else win_lo
+                read = {key: kv_cache[key][:, lo:local_end_index] for key in names}
+            q_pos = torch.full((1,), cur, dtype=torch.long, device=q.device)
+            roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=cur).type_as(va)
+            pos_frames = read["pos"][0, ::fs]
+            new_global, new_local = current_end, local_end_index
+        L = read["k"].shape[1]
+        if L % fs:
+            raise RuntimeError("memory_lora_distance_gate: the cache read is not whole frames")
+        m = L // fs
+        dist = (q_pos - pos_frames).clamp(0, MEMORY_LORA_GATE_DISTANCES - 1)
+        window_grid = grid_sizes.clone()
+        window_grid[:, 0] = m
+        if mix:
+            kL_r, k0_r = read["k"].to(va.dtype), read["k0"].to(va.dtype)
+            if self.kv_rope_relative:
+                kL_r = causal_rope_apply_frames(kL_r, window_grid, freqs, pos_frames).type_as(va)
+                k0_r = causal_rope_apply_frames(k0_r, window_grid, freqs, pos_frames).type_as(va)
+            roped_key, v_r = self._mix_kv(kL_r, k0_r, read["v"].to(va.dtype), read["zv"].to(zv.dtype), dist,
+                                          mem=read["mem"][0, ::fs])
+        else:
+            k_r, v_r = self._gated_kv(read["k"].reshape(b, L, n * d).to(ka.dtype), read["v"].reshape(b, L, n * d).to(va.dtype),
+                                      read["zk"].to(zv.dtype), read["zv"].to(zv.dtype), dist, mem=read["mem"][0, ::fs])
+            roped_key = causal_rope_apply_frames(k_r, window_grid, freqs, pos_frames).type_as(v_r)
+        x = attention(roped_query, roped_key, v_r)
+        kv_cache["global_end_index"].fill_(new_global)
+        kv_cache["local_end_index"].fill_(new_local)
+        return self.o(x.flatten(2))
+    # ==== ours end ====
 
     # ======== ours ========
     def forward_persistent(self, x, rope, history, write_page=False, kv_only=False,
@@ -825,6 +1221,10 @@ class CausalWanSelfAttention(nn.Module):
         """
         if write_mask is not None:
             return self.forward_persistent_pair(x, rope, history, write_mask, rope_hist)
+        # ======== ours (distance gate) ========
+        if self.distance_gate is not None:
+            return self._forward_persistent_gated(x, rope, history, write_page, kv_only, rope_hist)
+        # ==== ours end ====
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if not kv_only:
             q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -877,6 +1277,10 @@ class CausalWanSelfAttention(nn.Module):
         page is a fresh tensor; the V page (and the h page) is copied out of the
         fused batch, which a view would pin.
         """
+        # ======== ours (distance gate) ========
+        if self.distance_gate is not None:
+            return self._forward_persistent_pair_gated(x, rope, history, write_mask, rope_hist)
+        # ==== ours end ====
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         h = b // 2
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -907,6 +1311,198 @@ class CausalWanSelfAttention(nn.Module):
                 k_attn, v_attn = torch.cat([k_noisy, k_write]), torch.cat([v_noisy, v_write])
         y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
         return (y, *page)
+
+    # ======== ours (distance gate) ========
+    def _gated_history(self, history, s, rope_hist):
+        """The history K (after RoPE) and V [B, m * s, n, d] of a gated layer as the frame being computed reads
+        them, or None for an empty history. A history of m pages is read by frame m (the pages are frames
+        0..m-1, slot j = RoPE position j, `rope_hist` the RoPE table of frames 0..m-1), so page j is at
+        d = min(m - j, 20). The parts come from the page table (kv pages; with gradient through _PageParts,
+        which routes each page's gradient to its handles) or are recomputed from the h pages with the writers'
+        ops; either way K, V are built inside the reader's forward and checkpoint region."""
+        mix = self.distance_gate == "mix"
+        if isinstance(history, HPageRead):
+            m = len(history.pages)
+            if not m:
+                return None
+            hh = _HPageCat.apply(*history.pages)
+            if mix:
+                parts = self._mix_parts_from_h(hh, rope_hist)
+            else:
+                parts = (self.k(hh), self.v(hh), self.k_memory_lora.down(hh), self.v_memory_lora.down(hh))
+        else:
+            if not isinstance(history, GatedPageRead):
+                raise TypeError("a gated layer reads GatedPersistentKVStore pages; got %s" % type(history).__name__)
+            m = history.length
+            if not m:
+                return None
+            if not torch.is_grad_enabled() and not mix:
+                cached = history.table.hist_kv
+                if cached is not None and cached[0] == (m, s):
+                    return cached[1]
+            views = history.table.view(m)
+            if torch.is_grad_enabled():
+                if len(history.handles) not in (0, m):
+                    raise RuntimeError("distance gate: %d page handles for %d pages" % (len(history.handles), m))
+                parts = tuple(_PageParts.apply(view, *(hd[i] for hd in history.handles))
+                              for i, view in enumerate(views))
+            else:
+                parts = views
+        if rope_hist is None or rope_hist.shape[0] != m * s:
+            raise RuntimeError("distance gate: the history must be the pages of frames 0..m-1, read by frame m")
+        dist = torch.arange(m, 0, -1, device=parts[0].device).clamp_(max=MEMORY_LORA_GATE_DISTANCES - 1)
+        if mix:                                  # pages written once, read with an elementwise mix
+            return self._mix_kv(*parts, dist)
+        k, v = self._gated_kv(*parts, dist)
+        out = (_rope_apply(k, rope_hist).type_as(v), v)
+        if not torch.is_grad_enabled() and isinstance(history, GatedPageRead):
+            history.table.hist_kv = ((m, s), out)
+        return out
+
+    def _gated_history_checkpointed(self, history, s, rope_hist):
+        """_gated_history, with gradient as its own (nested) activation-checkpoint region: what it builds (the parts'
+        copies, W x + dW(d) x before norm_k, norm_k's float32 intermediates, the gated LoRA terms) is then recomputed
+        in the backward pass instead of being kept for the whole recomputation of the enclosing block group; only the
+        K, V it returns (which flash-attn keeps anyway) remain. The same operations, so the same values."""
+        empty = (len(history.pages) == 0) if isinstance(history, HPageRead) else (history.length == 0)
+        if empty or not torch.is_grad_enabled():
+            return self._gated_history(history, s, rope_hist)
+        return torch.utils.checkpoint.checkpoint(self._gated_history, history, s, rope_hist,
+                                                 use_reentrant=False, preserve_rng_state=False)
+
+    def _forward_persistent_gated(self, x, rope, history, write_page, kv_only, rope_hist):
+        """forward_persistent of a gated layer. A page is the parts (W_k x, W_v x, down_k(x), down_v(x)), or, for
+        h pages with gradient, (the parts detached, x). The frame's own K/V are W x (generation) or
+        (W + dW(0)) x (memory write), as in the ungated layer; the history is _gated_history."""
+        if self.distance_gate == "mix":
+            return self._forward_persistent_mix(x, rope, history, write_page, kv_only, rope_hist)
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        h_pages = isinstance(history, HPageRead)
+        if h_pages and not torch.is_grad_enabled():
+            raise RuntimeError("h pages are for forwards with gradient.")
+        kk, vv = self.k(x), self.v(x)
+        page = ()
+        if write_page:                           # the page write IS the memory write
+            zk, zv = self.k_memory_lora.down(x), self.v_memory_lora.down(x)
+            page = (kk, vv, zk, zv)
+            if h_pages:
+                page = tuple(p.detach() for p in page) + (x,)
+            if kv_only:
+                return page
+            kk = kk + self._gated_own(self.k_memory_lora, zk)
+            vv = vv + self._gated_own(self.v_memory_lora, zv)
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(kk).view(b, s, n, d)
+        v = vv.view(b, s, n, d)
+        q_rope = _rope_apply(q, rope).type_as(v)
+        k_rope = _rope_apply(k, rope).type_as(v)
+        hist = self._gated_history_checkpointed(history, s, rope_hist)
+        if hist is None:
+            k_attn, v_attn = k_rope, v
+        else:
+            k_attn, v_attn = torch.cat([hist[0], k_rope], dim=1), torch.cat([hist[1], v], dim=1)
+        y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
+        return (y, *page) if write_page else y
+
+    def _forward_persistent_pair_gated(self, x, rope, history, write_mask, rope_hist):
+        """forward_persistent_pair of a gated layer: the Memory-LoRA at d = 0 on the write half only (times
+        write_mask, as ungated), one history K/V (both halves are the same frame, so they read it at the same
+        distances), and the write half's parts as its page, copied out of the fused batch."""
+        if self.distance_gate == "mix":
+            return self._forward_persistent_pair_mix(x, rope, history, write_mask, rope_hist)
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        h = b // 2
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        ka, va = self.k(x), self.v(x)
+        zk, zv = self.k_memory_lora.down(x), self.v_memory_lora.down(x)
+        kk = ka + self._gated_own(self.k_memory_lora, zk) * write_mask
+        vv = va + self._gated_own(self.v_memory_lora, zv) * write_mask
+        k = self.norm_k(kk).view(b, s, n, d)
+        v = vv.view(b, s, n, d)
+        q_rope = _rope_apply(q, rope).type_as(v)
+        k_noisy = _rope_apply(k[:h], rope).type_as(v)
+        k_write = _rope_apply(k[h:], rope).type_as(v)
+        v_noisy, v_write = v[:h], v[h:]
+        if isinstance(history, HPageRead):
+            page = tuple(p[h:].detach() for p in (ka, va, zk, zv)) + (x[h:].clone(),)
+        else:
+            page = tuple(p[h:].clone() for p in (ka, va, zk, zv))
+        hist = self._gated_history_checkpointed(history, s, rope_hist)
+        if hist is None:
+            k_attn, v_attn = torch.cat([k_noisy, k_write]), torch.cat([v_noisy, v_write])
+        else:
+            k_hist, v_hist = hist
+            k_attn = torch.cat([torch.cat([k_hist, k_noisy], dim=1), torch.cat([k_hist, k_write], dim=1)])
+            v_attn = torch.cat([torch.cat([v_hist, v_noisy], dim=1), torch.cat([v_hist, v_write], dim=1)])
+        y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
+        return (y, *page)
+
+    def _forward_persistent_mix(self, x, rope, history, write_page, kv_only, rope_hist):
+        """forward_persistent of a mix layer. The memory write computes K^L (the ungated write's K, op for op), K^0, V^0
+        and z_v and keeps them as its page (K^L, K^0 in the page dtype); it attends to itself at d = 0 with the mix of
+        g_0. A generation forward computes and attends to W x, as ungated."""
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        h_pages = isinstance(history, HPageRead)
+        if h_pages and not torch.is_grad_enabled():
+            raise RuntimeError("h pages are for forwards with gradient.")
+        kk, vv = self.k(x), self.v(x)
+        v0 = vv.view(b, s, n, d)
+        page = ()
+        if write_page:
+            zv = self.v_memory_lora.down(x)
+            kL = _rope_apply(self.norm_k(kk + self.k_memory_lora(x)).view(b, s, n, d), rope).type_as(v0)
+            k0 = _rope_apply(self.norm_k(kk).view(b, s, n, d), rope).type_as(v0)
+            ad = _attn_dtype(v0.dtype)
+            page = (kL.to(ad), k0.to(ad), v0, zv)
+            if h_pages:
+                page = tuple(p.detach() for p in page) + (x,)
+            if kv_only:
+                return page
+            k_own, v_own = self._mix_kv(kL, k0, v0, zv, torch.zeros(1, dtype=torch.long, device=x.device))
+        else:
+            k_own, v_own = _rope_apply(self.norm_k(kk).view(b, s, n, d), rope).type_as(v0), v0
+        q_rope = _rope_apply(self.norm_q(self.q(x)).view(b, s, n, d), rope).type_as(v0)
+        hist = self._gated_history_checkpointed(history, s, rope_hist)
+        if hist is None:
+            k_attn, v_attn = k_own, v_own
+        else:
+            k_attn, v_attn = torch.cat([hist[0], k_own.to(hist[0].dtype)], dim=1), torch.cat([hist[1], v_own], dim=1)
+        y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
+        return (y, *page) if write_page else y
+
+    def _forward_persistent_pair_mix(self, x, rope, history, write_mask, rope_hist):
+        """forward_persistent_pair of a mix layer: the noisy half is a generation forward (W x; the Memory-LoRA term
+        times write_mask = 0, as ungated), the write half a memory write (K^L, K^0, V^0, z_v; own K/V mixed at d = 0)."""
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        h = b // 2
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        kk, vv = self.k(x), self.v(x)
+        zv = self.v_memory_lora.down(x)
+        kL = self.norm_k(kk + self.k_memory_lora(x) * write_mask).view(b, s, n, d)
+        k0 = self.norm_k(kk[h:]).view(h, s, n, d)
+        v0 = vv.view(b, s, n, d)
+        q_rope = _rope_apply(q, rope).type_as(v0)
+        k_noisy = _rope_apply(kL[:h], rope).type_as(v0)
+        kL_w = _rope_apply(kL[h:], rope).type_as(v0)
+        k0_w = _rope_apply(k0, rope).type_as(v0)
+        v_noisy, v0_w, zv_w = v0[:h], v0[h:], zv[h:]
+        k_write, v_write = self._mix_kv(kL_w, k0_w, v0_w, zv_w, torch.zeros(1, dtype=torch.long, device=x.device))
+        ad = _attn_dtype(v0.dtype)
+        if isinstance(history, HPageRead):
+            page = (kL_w.detach().to(ad), k0_w.detach().to(ad), v0_w.detach(), zv_w.detach(), x[h:].clone())
+        else:
+            page = (kL_w.to(ad), k0_w.to(ad), v0_w.clone(), zv_w.clone())
+        hist = self._gated_history_checkpointed(history, s, rope_hist)
+        if hist is None:
+            k_attn, v_attn = torch.cat([k_noisy, k_write]), torch.cat([v_noisy, v_write])
+        else:
+            k_hist, v_hist = hist
+            k_attn = torch.cat([torch.cat([k_hist, k_noisy.to(k_hist.dtype)], dim=1),
+                                torch.cat([k_hist, k_write.to(k_hist.dtype)], dim=1)])
+            v_attn = torch.cat([torch.cat([v_hist, v_noisy], dim=1), torch.cat([v_hist, v_write], dim=1)])
+        y = self.o(_flash_attention(q_rope, k_attn, v_attn).flatten(2))
+        return (y, *page)
+    # ==== ours end ====
     # ==== ours end ====
 
 
@@ -923,7 +1519,8 @@ class CausalWanAttentionBlock(nn.Module):
                  cross_attn_norm=False,
                  eps=1e-6,
                  # ======== ours ========
-                 memory_lora=False
+                 memory_lora=False,
+                 memory_lora_distance_gate=None
                  # ==== ours end ====
                  ):
         super().__init__()
@@ -939,7 +1536,8 @@ class CausalWanAttentionBlock(nn.Module):
         self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps,
                                                 # ======== ours ========
-                                                memory_lora=memory_lora
+                                                memory_lora=memory_lora,
+                                                memory_lora_distance_gate=memory_lora_distance_gate
                                                 # ==== ours end ====
                                                 )
         self.norm3 = WanLayerNorm(
@@ -1139,7 +1737,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  cross_attn_norm=True,
                  eps=1e-6,
                  # ======== ours ========
-                 memory_lora=False
+                 memory_lora=False,
+                 memory_lora_distance_gate=None
                  # ==== ours end ====
                  ):
         r"""
@@ -1219,7 +1818,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                     local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
                                     # ======== ours ========
-                                    memory_lora=memory_lora
+                                    memory_lora=memory_lora,
+                                    memory_lora_distance_gate=memory_lora_distance_gate
                                     # ==== ours end ====
                                     )
             for _ in range(num_layers)
@@ -1256,6 +1856,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # KVForcingTrainingPipeline; inference never takes that path.
         self.persistent_block_checkpointing = False
         self.persistent_checkpoint_group = 1
+        # Memory-LoRA distance gate (None = ungated); see MemoryLoRA.gated
+        self.memory_lora_distance_gate = memory_lora_distance_gate_mode(memory_lora_distance_gate)
         # ==== ours end ====
 
     def _set_gradient_checkpointing(self, module, value=False):
@@ -1913,8 +2515,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         ckpt = self.persistent_block_checkpointing and torch.is_grad_enabled()
         rope = _rope_table(self.freqs, grid_sizes, frame_idx)
         # h pages: the RoPE table of the history frames 0..frame_idx-1, for the K/V rebuild
+        # (distance gate: every forward builds its history K/V and needs it as well)
         rope_hist = (self._history_rope(grid_sizes, frame_idx)
-                     if frame_idx and isinstance(histories[0], HPageRead) else None)
+                     if frame_idx and (isinstance(histories[0], HPageRead)
+                                       or self.memory_lora_distance_gate is not None) else None)
         x, pages = latent, []
         for first in range(0, n, g):
             last = min(first + g, n)

@@ -127,7 +127,13 @@ if args.checkpoint_path:
             if k.startswith("model._fsdp_wrapped_module."):
                 k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
             fixed[k] = v
-        pipeline.generator.load_state_dict(fixed, strict=False)
+        # ======== ours ========
+        res = pipeline.generator.load_state_dict(fixed, strict=False)
+        gate_missing = [k for k in res.missing_keys if k.endswith("memory_lora.distance_gate")]
+        if gate_missing:
+            print(f"memory_lora_distance_gate: the checkpoint has no gate; {len(gate_missing)} gate tensors stay at "
+                  f"their init (the identity gate, i.e. the ungated Memory-LoRA)")
+        # ==== ours end ====
 
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:

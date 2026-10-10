@@ -11,6 +11,9 @@ from utils.misc import set_seed
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import DMD
+# ======== ours ========
+from wan.modules.causal_model import memory_lora_distance_gate_from_config
+# ==== ours end ====
 import torch
 import wandb
 import time
@@ -65,6 +68,17 @@ class Trainer:
 
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
+
+        # ======== ours ========
+        # Memory-LoRA distance gate: its parameters as the model initialised them (the identity gate), kept to
+        # fill them in when generator_ckpt was saved without a gate (e.g. causal_cd_lora_init.pt). Taken before
+        # FSDP flattens the parameters; the keys are those of the full state dict.
+        self.distance_gate_mode = memory_lora_distance_gate_from_config(config)
+        self.distance_gate_init = {}
+        if self.distance_gate_mode is not None:
+            self.distance_gate_init = {k: v.detach().clone().cpu() for k, v in self.model.generator.state_dict().items()
+                                       if k.endswith("memory_lora.distance_gate")}
+        # ==== ours end ====
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -125,13 +139,25 @@ class Trainer:
         gen_params = [p for p in self.model.generator.parameters() if p.requires_grad]
         lora_params = [p for n, p in self.model.generator.named_parameters()
                        if p.requires_grad and "memory_lora" in n]
+        # Memory-LoRA distance gate with its own learning rate (lr_memory_lora_gate; None = it stays in the
+        # memory-adapter group): the gate tensors become a third group. Without a gate nothing here changes.
+        gate_lr = getattr(config, "lr_memory_lora_gate", None)
+        gate_params = [p for n, p in self.model.generator.named_parameters()
+                       if p.requires_grad and n.endswith("memory_lora.distance_gate")] if gate_lr is not None else []
+        if gate_params:
+            gate_ids = {id(p) for p in gate_params}
+            lora_params = [p for p in lora_params if id(p) not in gate_ids]
         if lora_params:
-            lora_ids = {id(p) for p in lora_params}
+            lora_ids = {id(p) for p in lora_params} | {id(p) for p in gate_params}
             param_groups = [{"params": [p for p in gen_params if id(p) not in lora_ids], "lr": config.lr},
                             {"params": lora_params, "lr": float(getattr(config, "lr_memory_lora", config.lr))}]
+            if gate_params:
+                param_groups.append({"params": gate_params, "lr": float(gate_lr)})
             if self.is_main_process:
                 print(f"generator optimizer: {len(param_groups[0]['params'])} backbone tensors at lr={config.lr}, "
-                      f"{len(lora_params)} memory-adapter tensors at lr={param_groups[1]['lr']}", flush=True)
+                      f"{len(lora_params)} memory-adapter tensors at lr={param_groups[1]['lr']}"
+                      + (f", {len(gate_params)} distance-gate tensors at lr={param_groups[2]['lr']}" if gate_params else ""),
+                      flush=True)
         else:
             param_groups = [{"params": gen_params, "lr": config.lr}]
         # ==== ours end ====
@@ -207,6 +233,21 @@ class Trainer:
                         k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
                     fixed[k] = v
                 state_dict = fixed
+            # ======== ours ========
+            # A gated run started from a checkpoint without a gate initialises the gate (identity) instead of
+            # loading it; everything else still loads strictly. A checkpoint with the gate loads it.
+            if self.distance_gate_init:
+                missing = [k for k in self.distance_gate_init if k not in state_dict]
+                if missing and len(missing) != len(self.distance_gate_init):
+                    raise RuntimeError(f"generator_ckpt has {len(self.distance_gate_init) - len(missing)} of "
+                                       f"{len(self.distance_gate_init)} distance-gate tensors")
+                if missing:
+                    state_dict = dict(state_dict)
+                    state_dict.update({k: self.distance_gate_init[k] for k in missing})
+                if self.is_main_process:
+                    print(f"memory_lora_distance_gate: {len(missing)} gate tensors initialised (identity), "
+                          f"{len(self.distance_gate_init) - len(missing)} loaded from generator_ckpt", flush=True)
+            # ==== ours end ====
             self.model.generator.load_state_dict(
                 state_dict, strict=True
             )
@@ -235,6 +276,10 @@ class Trainer:
         self.previous_time = None
         self.step_time_log_interval = max(
             0, int(getattr(config, "step_time_log_interval", 0) or 0))
+        # ======== ours ========
+        if self.distance_gate_mode is not None:    # the gate the run starts from (identity, or the resumed one)
+            self.log_distance_gate()
+        # ==== ours end ====
 
     # ======== ours ========
     def _next_batch(self):
@@ -324,6 +369,40 @@ class Trainer:
         if self.is_main_process:
             print(f"[resume] continuing after step {self.step} from {d} "
                   f"({self._batches_consumed} batches already drawn)", flush=True)
+    # ==== ours end ====
+
+    # ======== ours ========
+    @torch.no_grad()
+    def log_distance_gate(self):
+        """Memory-LoRA distance gate (memory_lora_distance_gate set): one line per K and V with the gate over all
+        layers (min / mean / max) and its layer mean per distance d = 0..20: g_d for scalar, rank and channel (mean
+        over ranks / channels), the RMS of b_d over channels for input, g_d = sigmoid(theta_d) for mix. FSDP shards
+        the gate tensors, so they are gathered with summon_full_params, which every rank enters: for the moment of the log every rank holds the
+        generator's full fp32 parameters on its GPU (about 5.7 GB for the 1.3B model; between steps, far below a
+        step's peak). Also logged to wandb as gate/{K,V}/d{d}, gate/{K,V}/min, gate/{K,V}/max."""
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        gates = {"K": [], "V": []}
+        with FSDP.summon_full_params(self.model.generator, writeback=False):
+            if self.is_main_process:
+                for n, p in self.model.generator.named_parameters():
+                    if n.endswith("memory_lora.distance_gate"):
+                        gates["K" if ".k_memory_lora." in n else "V"].append(p.detach().double().cpu().clone())
+        if not self.is_main_process:
+            return
+        mode, log = self.distance_gate_mode, {}
+        for which, gs in gates.items():
+            g = torch.stack(gs)                                    # [layers, 21] or [layers, 21, C]
+            if mode == "mix":                                      # the mixing weight g = sigmoid(theta)
+                g = torch.sigmoid(g)
+            per_d = (g.pow(2).mean(-1).sqrt() if mode == "input" else (g if g.dim() == 2 else g.mean(-1))).mean(0)
+            log.update({f"gate/{which}/d{d}": float(v) for d, v in enumerate(per_d)})
+            log.update({f"gate/{which}/min": float(g.min()), f"gate/{which}/max": float(g.max())})
+            print("[gate] step %d %s %s (%d layers): min %.4f mean %.4f max %.4f | %s by d: %s" % (
+                self.step, mode, which, g.shape[0], float(g.min()), float(g.mean()), float(g.max()),
+                "rms(b_d)" if mode == "input" else ("mean sigmoid(theta_d)" if mode == "mix" else "mean g_d"),
+                " ".join("%.4f" % float(v) for v in per_d)), flush=True)
+        if not self.disable_wandb:
+            wandb.log(log, step=self.step)
     # ==== ours end ====
 
     def save(self):
@@ -502,6 +581,11 @@ class Trainer:
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()
+
+            # ======== ours ========
+            if self.distance_gate_mode is not None and self.step % self.config.log_iters == 0:
+                self.log_distance_gate()           # collective (gathers the gate tensors on every rank)
+            # ==== ours end ====
 
             # Logging
             if self.is_main_process:

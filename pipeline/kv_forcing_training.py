@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from wan.modules.causal_model import PersistentKVStore
+from wan.modules.causal_model import GatedPersistentKVStore
 
 
 class KVForcingTrainingPipeline:
@@ -165,9 +166,13 @@ class KVForcingTrainingPipeline:
 
         model.persistent_block_checkpointing = self.gradient_checkpointing
         model.persistent_checkpoint_group = self.checkpoint_group
-        # one page-table slot per page; the last block writes none (see below)
-        store = PersistentKVStore(len(model.blocks), max_frames=num_frames - self.num_frame_per_block,
-                                  page_mode=self.page_mode)
+        # one page-table slot per page; the last block writes none (see below).
+        # A model with a Memory-LoRA distance gate keeps the parts of every memory write instead of its K/V
+        # (GatedPersistentKVStore): each reader builds the K/V at its own distance.
+        store_cls = (GatedPersistentKVStore if getattr(model, "memory_lora_distance_gate", None) is not None
+                     else PersistentKVStore)
+        store = store_cls(len(model.blocks), max_frames=num_frames - self.num_frame_per_block,
+                          page_mode=self.page_mode)
         outputs = []
         start = 0
         for _ in range(num_blocks):

@@ -31,6 +31,14 @@ kv_forcing_fuse_grad_forwards: false
 kv_forcing_page_mode: kv
 # with mixed_precision false, still run the frozen teacher (real_score) in bf16
 real_score_bf16: false
+# Memory-LoRA distance gate (needs model_kwargs.memory_lora: true and grad_mode: kv_forcing):
+# none | scalar | rank | channel | input | mix. The Memory-LoRA of a cached frame then depends on its distance
+# d = clamp(pos_query - pos_key, 0, 20) (RoPE positions) to the frame being computed; at init scalar, rank,
+# channel, input are the ungated Memory-LoRA, mix is the half-way mix g = 0.5 of the K/V with and without it.
+# none (default) builds no gate and runs the code paths unchanged.
+memory_lora_distance_gate: none
+# learning rate of the distance-gate tensors (their own optimizer group); null = they share lr_memory_lora
+lr_memory_lora_gate: null
 # ==== ours end ====
 causal: true
 

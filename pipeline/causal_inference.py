@@ -3,6 +3,9 @@ import time
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+# ======== ours ========
+from wan.modules.causal_model import memory_lora_distance_gate_from_config
+# ==== ours end ====
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 import tqdm
@@ -18,8 +21,14 @@ class CausalInferencePipeline(torch.nn.Module):
     ):
         super().__init__()
         # Step 1: Initialize all models
+        # ======== ours ========
+        # Memory-LoRA distance gate (top-level memory_lora_distance_gate), passed on only when set
+        gen_kwargs = dict(getattr(args, "model_kwargs", {}))
+        if memory_lora_distance_gate_from_config(args) is not None:
+            gen_kwargs["memory_lora_distance_gate"] = memory_lora_distance_gate_from_config(args)
+        # ==== ours end ====
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+            **gen_kwargs, is_causal=True) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper() if vae is None else vae
 
